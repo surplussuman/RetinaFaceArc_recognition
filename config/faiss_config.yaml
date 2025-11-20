@@ -1,0 +1,183 @@
+# FAISS Vector Database Configuration
+# Fast similarity search for face embeddings
+
+# Index type
+index:
+  # Index type options:
+  # - "Flat": Exact search (L2 or cosine)
+  # - "HNSW": Hierarchical Navigable Small World (fast approximate)
+  # - "IVF": Inverted File Index (for large-scale)
+  # - "PQ": Product Quantization (memory efficient)
+  type: "Flat"
+  
+  # Metric type
+  # - "cosine": Cosine similarity (recommended for ArcFace)
+  # - "l2": Euclidean distance
+  # - "inner_product": Inner product (for normalized vectors = cosine)
+  metric: "cosine"
+  
+  # Dimension (must match embedding dimension)
+  dimension: 512
+
+# Index-specific parameters
+flat:
+  # No parameters needed for Flat index
+  # Provides exact nearest neighbor search
+  use_gpu: true
+
+hnsw:
+  # Number of neighbors per layer (M parameter)
+  # Higher = better accuracy, more memory
+  # Typical: 16-64
+  M: 32
+  
+  # Size of dynamic candidate list (efConstruction)
+  # Higher = better index quality, slower build
+  # Typical: 40-500
+  efConstruction: 200
+  
+  # Size of dynamic candidate list during search (efSearch)
+  # Higher = better accuracy, slower search
+  # Typical: 16-512
+  efSearch: 64
+
+ivf:
+  # Number of clusters (nlist)
+  # Rule of thumb: sqrt(N) to 4*sqrt(N)
+  # For N=100: 10-40
+  nlist: 20
+  
+  # Number of clusters to search (nprobe)
+  # Higher = better accuracy, slower search
+  # Typical: 1-nlist
+  nprobe: 5
+  
+  # Use GPU for search
+  use_gpu: true
+
+pq:
+  # Number of sub-vectors (M parameter)
+  # Must divide dimension evenly
+  # For d=512: 64, 128, 256
+  M: 64
+  
+  # Number of bits per sub-vector
+  # Typical: 8 (256 centroids)
+  nbits: 8
+
+# Search parameters
+search:
+  # Number of nearest neighbors to retrieve
+  k: 1  # For identification, typically k=1
+  
+  # Maximum k for batch search
+  max_k: 10
+  
+  # Return distances along with indices
+  return_distances: true
+  
+  # Distance threshold for matching
+  # For cosine similarity: higher = more similar
+  # Typical range: 0.36 - 0.45
+  threshold: 0.40
+
+# Database management
+database:
+  # Path to save/load index
+  index_path: "data/faiss_index/face_index.faiss"
+  
+  # Path to metadata (user IDs, names, etc.)
+  metadata_path: "data/faiss_index/metadata.pkl"
+  
+  # Auto-save after N additions
+  auto_save_interval: 10
+  
+  # Backup before overwrite
+  create_backup: true
+  backup_path: "data/faiss_index/backups/"
+
+# User management
+users:
+  # Maximum number of users
+  max_users: 10000
+  
+  # Embeddings per user
+  embeddings_per_user: 1  # Store averaged embedding
+  
+  # Allow multiple embeddings per user
+  store_all_embeddings: false
+  
+  # Metadata fields
+  metadata_fields:
+    - "user_id"
+    - "name"
+    - "enrollment_date"
+    - "num_samples"
+    - "quality_score"
+
+# Performance optimization
+optimization:
+  # Use GPU acceleration
+  use_gpu: true
+  gpu_id: 0
+  
+  # Precompute normalized vectors
+  precompute_norms: true
+  
+  # Multi-threading for CPU
+  num_threads: 4
+  
+  # Batch operations
+  batch_add: true
+  batch_search: true
+
+# Quality control
+quality:
+  # Minimum quality score for enrollment
+  min_enrollment_quality: 0.6
+  
+  # Check for duplicates during enrollment
+  check_duplicates: true
+  duplicate_threshold: 0.85  # Cosine similarity
+  
+  # Minimum samples per user
+  min_samples_per_user: 5
+  
+  # Maximum samples per user (for averaging)
+  max_samples_per_user: 50
+
+# Embedding aggregation
+aggregation:
+  # Method to aggregate multiple embeddings per user
+  # Options: "mean", "median", "weighted_mean"
+  method: "mean"
+  
+  # Normalize after aggregation
+  normalize_after: true
+  
+  # Outlier rejection before aggregation
+  outlier_rejection:
+    enable: true
+    method: "zscore"  # Options: zscore, iqr, isolation_forest
+    threshold: 3.0
+
+# Statistics & monitoring
+statistics:
+  # Track search statistics
+  track_stats: true
+  
+  # Statistics to track
+  metrics:
+    - "search_time"
+    - "num_searches"
+    - "hit_rate"
+    - "avg_distance"
+  
+  # Log statistics interval (seconds)
+  log_interval: 300
+
+# Debugging
+debug:
+  verbose: false
+  log_operations: false
+  save_search_results: false

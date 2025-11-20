@@ -1,0 +1,62 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+onnxruntime-gpu>=1.16.0
+onnx>=1.14.0
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+
+# Vector Database & Search
+faiss-gpu>=1.7.4
+# faiss-cpu>=1.7.4  # Use this if no GPU available
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Tracking
+filterpy>=1.4.5
+lap>=0.4.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Configuration & I/O
+pyyaml>=6.0
+toml>=0.10.2
+json5>=0.9.14
+
+# Logging & Monitoring
+tqdm>=4.65.0
+loguru>=0.7.0
+tensorboard>=2.13.0
+
+# API & Deployment
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# Utilities
+albumentations>=1.3.0
+imgaug>=0.4.0
+einops>=0.6.1
+
+# Development & Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.7.0
+flake8>=6.0.0
+mypy>=1.4.0
+
+# Optional: TensorRT (install separately)
+# nvidia-tensorrt>=8.6.0
+
+# Optional: MLflow for experiment tracking
+# mlflow>=2.5.0

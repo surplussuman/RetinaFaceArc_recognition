@@ -1,0 +1,123 @@
+# RetinaFace Detector Configuration
+# Based on FPN multi-scale detection architecture
+
+model:
+  name: "retinaface_resnet50"
+  path: "models/retinaface_resnet50.onnx"
+  backbone: "resnet50"  # Options: resnet50, mobilenet0.25
+  
+  # Alternative lightweight model
+  # name: "retinaface_mobilenet"
+  # path: "models/retinaface_mobilenet.onnx"
+  # backbone: "mobilenet0.25"
+
+# Detection parameters
+detection:
+  # Minimum face size in pixels (16x16 for crowd scenarios)
+  min_face_size: 16
+  
+  # Confidence threshold for face detection
+  confidence_threshold: 0.7
+  
+  # Non-Maximum Suppression
+  nms:
+    iou_threshold: 0.4
+    top_k: 5000  # Before NMS
+    keep_top_k: 750  # After NMS (for crowded scenes)
+  
+  # Multi-scale detection (FPN levels)
+  scales:
+    - [16, 32]      # P3: small faces
+    - [32, 64]      # P4: medium faces  
+    - [64, 128]     # P5: large faces
+    - [128, 256]    # P6: very large faces
+    - [256, 512]    # P7: extra large faces
+  
+  # Anchor stride per pyramid level
+  strides: [8, 16, 32, 64, 128]
+  
+  # Anchor aspect ratios
+  anchor_ratios: [1.0]
+
+# Input preprocessing
+preprocessing:
+  # Target input size (width, height)
+  input_size: [640, 640]
+  
+  # Mean and std for normalization (ImageNet stats)
+  mean: [104.0, 117.0, 123.0]  # BGR order
+  std: [1.0, 1.0, 1.0]
+  
+  # Pixel value scaling
+  scale: 1.0
+  
+  # Keep aspect ratio when resizing
+  keep_aspect_ratio: true
+  
+  # Pad to target size if keeping aspect ratio
+  pad_to_size: true
+  pad_value: 0
+
+# Landmark configuration
+landmarks:
+  # Number of facial landmarks (fixed to 5)
+  num_points: 5
+  
+  # Landmark order: left_eye, right_eye, nose, mouth_left, mouth_right
+  point_names:
+    - "left_eye"
+    - "right_eye"  
+    - "nose"
+    - "mouth_left"
+    - "mouth_right"
+  
+  # Landmark quality threshold (lower = stricter)
+  # Measured as reprojection error in pixels
+  quality_threshold: 3.0
+
+# Loss function parameters (for reference / training)
+loss:
+  classification:
+    type: "cross_entropy"
+    weight: 1.0
+    
+  bbox_regression:
+    type: "smooth_l1"
+    weight: 2.0
+    beta: 0.1111  # 1/9
+    
+  landmark_regression:
+    type: "smooth_l1"  # Or L2
+    weight: 1.0
+    beta: 0.1111
+
+# Performance optimization
+optimization:
+  # Use ONNX Runtime execution providers
+  execution_providers:
+    - "CUDAExecutionProvider"
+    - "CPUExecutionProvider"
+  
+  # CUDA options
+  cuda:
+    device_id: 0
+    cudnn_conv_algo_search: "DEFAULT"  # Options: DEFAULT, EXHAUSTIVE, HEURISTIC
+    
+  # Session options
+  session:
+    intra_op_num_threads: 4
+    inter_op_num_threads: 4
+    graph_optimization_level: "ORT_ENABLE_ALL"
+
+# Batch processing
+batch:
+  enable: false
+  max_batch_size: 4
+  dynamic_batching: true
+
+# Debugging
+debug:
+  visualize_anchors: false
+  save_detections: false
+  log_inference_time: true
+  verbose: false

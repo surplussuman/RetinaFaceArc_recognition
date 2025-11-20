@@ -1,0 +1,324 @@
+# System-wide Configuration
+# Global parameters for face recognition system
+
+# Recognition thresholds
+recognition:
+  # Cosine similarity threshold
+  # Range: 0.0 (no match) to 1.0 (perfect match)
+  # Typical: 0.36 - 0.45
+  threshold: 0.40
+  
+  # Strict threshold for high-security scenarios
+  strict_threshold: 0.50
+  
+  # Lenient threshold for low-security scenarios
+  lenient_threshold: 0.35
+  
+  # Minimum confidence for valid match
+  min_confidence: 0.35
+  
+  # Unknown person label
+  unknown_label: "Unknown"
+
+# Temporal consistency (multi-frame smoothing)
+temporal:
+  # Enable temporal smoothing
+  enable: true
+  
+  # Window size (number of frames to average)
+  window_size: 5
+  
+  # Aggregation method
+  # Options: "mean", "median", "exponential", "voting"
+  aggregation: "mean"
+  
+  # Exponential moving average weight (if using "exponential")
+  ema_alpha: 0.3
+  
+  # Minimum frames for confirmation
+  min_confirmation_frames: 3
+  
+  # Maximum frames to keep in history
+  max_history: 30
+
+# Tracking configuration
+tracking:
+  # Tracking algorithm
+  # Options: "sort", "deepsort", "bytetrack"
+  algorithm: "bytetrack"
+  
+  # Maximum age (frames) before track deletion
+  max_age: 30
+  
+  # Minimum hits before track confirmation
+  min_hits: 3
+  
+  # IOU threshold for matching
+  iou_threshold: 0.3
+  
+  # Use appearance features for re-identification
+  use_appearance: true
+  
+  # Appearance matching threshold
+  appearance_threshold: 0.50
+  
+  # Track ID assignment
+  track_id:
+    start_id: 1
+    reset_on_restart: false
+
+# ByteTrack specific parameters
+bytetrack:
+  # High detection threshold
+  track_thresh: 0.6
+  
+  # Low detection threshold for recovery
+  track_buffer: 30
+  
+  # Matching threshold
+  match_thresh: 0.8
+  
+  # Frame rate
+  frame_rate: 30
+
+# SORT specific parameters
+sort:
+  # Maximum age before track deletion
+  max_age: 30
+  
+  # Minimum hits before confirmation
+  min_hits: 3
+  
+  # IOU threshold
+  iou_threshold: 0.3
+
+# Attendance system
+attendance:
+  # Number of consecutive frames to confirm presence
+  confirmation_frames: 3
+  
+  # Minimum time between duplicate entries (seconds)
+  duplicate_threshold_seconds: 300  # 5 minutes
+  
+  # Auto mark absent after N hours
+  auto_absent_hours: 24
+  
+  # Log format
+  log_format: "csv"  # Options: csv, json, sqlite
+  
+  # Log directory
+  log_dir: "data/logs/"
+  
+  # Log file naming
+  log_filename_format: "attendance_%Y%m%d.csv"
+  
+  # Fields to log
+  log_fields:
+    - "timestamp"
+    - "user_id"
+    - "name"
+    - "confidence"
+    - "track_id"
+    - "frame_number"
+    - "camera_id"
+
+# Supermarket analytics
+supermarket:
+  # Enable person tracking
+  enable_tracking: true
+  
+  # Enable re-identification across cameras
+  enable_reid: true
+  
+  # Dwell time analysis
+  dwell_time:
+    enable: true
+    min_dwell_seconds: 5
+    zones: []  # List of zone polygons
+  
+  # Entry/exit detection
+  entry_exit:
+    enable: true
+    entry_line: null  # [x1, y1, x2, y2]
+    exit_line: null
+  
+  # Crowd density
+  density:
+    enable: true
+    grid_size: [10, 10]
+    alert_threshold: 15  # people per cell
+  
+  # Heatmap generation
+  heatmap:
+    enable: true
+    resolution: [640, 480]
+    decay_factor: 0.95
+
+# Video processing
+video:
+  # Frame skip (process every Nth frame)
+  frame_skip: 1
+  
+  # Resize input frame
+  resize_frame: false
+  target_size: [1280, 720]
+  
+  # Frame buffer size
+  buffer_size: 10
+  
+  # Multi-threading
+  use_threading: true
+  num_workers: 2
+
+# Performance settings
+performance:
+  # Batch processing
+  batch_size: 4
+  
+  # Use TensorRT optimization
+  use_tensorrt: false
+  
+  # Use FP16 precision
+  fp16: false
+  
+  # GPU device
+  device: "cuda:0"  # or "cpu"
+  
+  # Benchmark mode
+  benchmark: false
+  
+  # Profile performance
+  profile: false
+
+# Visualization
+visualization:
+  # Enable visualization
+  enable: true
+  
+  # Show bounding boxes
+  show_bbox: true
+  bbox_color: [0, 255, 0]  # Green
+  bbox_thickness: 2
+  
+  # Show landmarks
+  show_landmarks: true
+  landmark_radius: 2
+  landmark_color: [255, 0, 0]  # Red
+  
+  # Show labels
+  show_labels: true
+  label_position: "top"  # Options: top, bottom
+  font_scale: 0.6
+  font_thickness: 2
+  
+  # Show confidence
+  show_confidence: true
+  
+  # Show track ID
+  show_track_id: true
+  
+  # Show FPS
+  show_fps: true
+  
+  # Color coding
+  color_by_identity: true
+  unknown_color: [128, 128, 128]  # Gray
+
+# Statistical analysis
+statistics:
+  # Enable statistics collection
+  enable: true
+  
+  # Metrics to track
+  metrics:
+    - "fps"
+    - "num_faces_detected"
+    - "num_faces_recognized"
+    - "avg_confidence"
+    - "processing_time"
+  
+  # Save statistics
+  save_stats: true
+  stats_file: "data/logs/statistics.json"
+  
+  # Update interval (seconds)
+  update_interval: 10
+
+# Error handling
+error_handling:
+  # Continue on error
+  continue_on_error: true
+  
+  # Retry count
+  max_retries: 3
+  
+  # Log errors
+  log_errors: true
+  error_log: "data/logs/errors.log"
+
+# Logging
+logging:
+  # Log level
+  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  
+  # Log to file
+  log_to_file: true
+  log_file: "data/logs/system.log"
+  
+  # Log format
+  format: "[{time:YYYY-MM-DD HH:mm:ss}] {level} | {message}"
+  
+  # Rotation
+  rotation: "10 MB"
+  retention: "30 days"
+
+# Development & debugging
+debug:
+  # Debug mode
+  enable: false
+  
+  # Save intermediate results
+  save_detections: false
+  save_alignments: false
+  save_embeddings: false
+  
+  # Output directory
+  output_dir: "data/debug/"
+  
+  # Verbose logging
+  verbose: false
+  
+  # Show timing information
+  show_timing: true
+
+# Security
+security:
+  # Enable access control
+  enable_access_control: false
+  
+  # Require authentication
+  require_auth: false
+  
+  # API key (for REST API)
+  api_key: null
+  
+  # Encrypt stored data
+  encrypt_data: false
+
+# Multi-camera support
+multi_camera:
+  # Enable multi-camera mode
+  enable: false
+  
+  # Camera configurations
+  cameras: []
+  # Example:
+  # - id: "camera_1"
+  #   source: 0
+  #   location: "entrance"
+  #   enabled: true
+  
+  # Cross-camera re-identification
+  cross_camera_reid: true
+  reid_threshold: 0.55
