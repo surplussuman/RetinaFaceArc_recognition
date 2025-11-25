@@ -26,15 +26,14 @@ detection:
     keep_top_k: 750  # After NMS (for crowded scenes)
   
   # Multi-scale detection (FPN levels)
+  # Note: This RetinaFace model uses only 3 FPN levels (P3, P4, P5)
   scales:
-    - [16, 32]      # P3: small faces
-    - [32, 64]      # P4: medium faces  
-    - [64, 128]     # P5: large faces
-    - [128, 256]    # P6: very large faces
-    - [256, 512]    # P7: extra large faces
+    - [16, 32]      # P3: small faces (stride 8)
+    - [32, 64]      # P4: medium faces (stride 16)
+    - [64, 128]     # P5: large faces (stride 32)
   
-  # Anchor stride per pyramid level
-  strides: [8, 16, 32, 64, 128]
+  # Anchor stride per pyramid level (must match model architecture)
+  strides: [8, 16, 32]
   
   # Anchor aspect ratios
   anchor_ratios: [1.0]
@@ -44,9 +43,10 @@ preprocessing:
   # Target input size (width, height)
   input_size: [640, 640]
   
-  # Mean and std for normalization (ImageNet stats)
-  mean: [104.0, 117.0, 123.0]  # BGR order
-  std: [1.0, 1.0, 1.0]
+  # Mean and std for normalization (InsightFace det_10g.onnx format)
+  # Formula: (pixel - mean) / std
+  mean: [127.5, 127.5, 127.5]  # RGB order (will be converted from BGR)
+  std: [128.0, 128.0, 128.0]
   
   # Pixel value scaling
   scale: 1.0
@@ -95,8 +95,7 @@ loss:
 optimization:
   # Use ONNX Runtime execution providers
   execution_providers:
-    - "CUDAExecutionProvider"
-    - "CPUExecutionProvider"
+    - "CPUExecutionProvider"  # GPU OOM with 4GB VRAM
   
   # CUDA options
   cuda:

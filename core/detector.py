@@ -68,7 +68,7 @@ class RetinaFaceDetector:
         # Generate anchors
         self._generate_anchors()
         
-        print(f"✓ RetinaFace detector initialized")
+        print(f"[OK] RetinaFace detector initialized")
         print(f"  Model: {self.config['model']['name']}")
         print(f"  Input size: {self.input_size}")
         print(f"  Min face size: {self.config['detection']['min_face_size']}px")
@@ -105,51 +105,45 @@ class RetinaFaceDetector:
     
     def _generate_anchors(self):
         """
-        Generate anchor boxes for each FPN level.
+        Generate anchor centers for each FPN level.
         
-        Anchors are generated based on:
-        - Feature map stride
-        - Anchor scales (min, max) per level
-        - Anchor aspect ratios (typically [1.0] for faces)
+        For RetinaFace/InsightFace det_10g model:
+        - Each FPN level has 2 anchor scales
+        - Anchor centers are grid points at stride intervals
+        - Total anchors: stride8(80x80x2=12800) + stride16(40x40x2=3200) + stride32(20x20x2=800) = 16800
         """
-        self.anchors = []
+        self.anchor_centers = []
+        self.num_anchors_per_level = []
         
-        for stride, scales in zip(self.feature_strides, self.anchor_scales):
+        for level_idx, (stride, scales) in enumerate(zip(self.feature_strides, self.anchor_scales)):
             # Calculate feature map size
             feat_h = self.input_size[1] // stride
             feat_w = self.input_size[0] // stride
             
-            # Generate anchor centers
-            shift_x = np.arange(0, feat_w) * stride
-            shift_y = np.arange(0, feat_h) * stride
-            shift_x, shift_y = np.meshgrid(shift_x, shift_y)
+            # Generate anchor centers using meshgrid (InsightFace style)
+            # anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+            anchor_centers = np.stack(np.mgrid[:feat_h, :feat_w][::-1], axis=-1).astype(np.float32)
+            anchor_centers = (anchor_centers * stride).reshape((-1, 2))
             
-            # Flatten and stack
-            shifts = np.vstack((
-                shift_x.ravel(),
-                shift_y.ravel(),
-                shift_x.ravel(),
-                shift_y.ravel()
-            )).transpose()
+            # For 2 anchors per location (num_anchors=2), duplicate the centers
+            if len(scales) > 1:
+                anchor_centers = np.stack([anchor_centers] * len(scales), axis=1).reshape((-1, 2))
             
-            # Generate anchors for this level
-            for scale in scales:
-                # For aspect ratio = 1.0
-                anchor = np.array([
-                    -scale / 2, -scale / 2,
-                    scale / 2, scale / 2
-                ], dtype=np.float32)
-                
-                # Apply shifts
-                anchors = shifts + anchor
-                self.anchors.append(anchors)
+            self.num_anchors_per_level.append(len(anchor_centers))
+            self.anchor_centers.append(anchor_centers)
         
-        self.anchors = np.vstack(self.anchors).astype(np.float32)
-        print(f"  Generated {len(self.anchors)} anchors across {len(self.feature_strides)} FPN levels")
+        self.anchor_centers = np.vstack(self.anchor_centers).astype(np.float32)
+        print(f"  Generated {len(self.anchor_centers)} anchor centers across {len(self.feature_strides)} FPN levels")
+        print(f"  Anchors per level: {self.num_anchors_per_level}")
     
     def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
         """
         Preprocess image for detection.
+        
+        Matches InsightFace preprocessing:
+        - Resize maintaining aspect ratio
+        - Pad to target size (padding at bottom-right, not centered)
+        - Normalize with mean=127.5, std=128.0
         
         Args:
             image: Input image (BGR format)
@@ -157,34 +151,41 @@ class RetinaFaceDetector:
         Returns:
             - Preprocessed image tensor
             - Scale factor
-            - Padding (pad_w, pad_h)
+            - Padding (pad_w, pad_h) - always (0, 0) for top-left padding
         """
         img_h, img_w = image.shape[:2]
         target_w, target_h = self.input_size
         
-        # Calculate resize scale
-        scale = min(target_w / img_w, target_h / img_h)
+        # Calculate resize scale (maintain aspect ratio)
+        im_ratio = float(img_h) / img_w
+        model_ratio = float(target_h) / target_w
+        
+        if im_ratio > model_ratio:
+            new_height = target_h
+            new_width = int(new_height / im_ratio)
+        else:
+            new_width = target_w
+            new_height = int(new_width * im_ratio)
+        
+        scale = float(new_height) / img_h
         
         # Resize image
-        new_w = int(img_w * scale)
-        new_h = int(img_h * scale)
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
         
-        # Pad to target size
-        pad_w = (target_w - new_w) // 2
-        pad_h = (target_h - new_h) // 2
-        
+        # Pad to target size (InsightFace style - top-left alignment)
         padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        padded[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = resized
+        padded[:new_height, :new_width] = resized
         
-        # Normalize (BGR format, subtract mean, divide by std)
+        # Normalize (note: InsightFace uses RGB order in blobFromImage with swapRB=True)
+        # This is equivalent to: (BGR_pixel - 127.5) / 128.0 in BGR order
         normalized = (padded.astype(np.float32) - self.mean) / self.std
         
         # Transpose to CHW format and add batch dimension
         tensor = np.transpose(normalized, (2, 0, 1))
         tensor = np.expand_dims(tensor, axis=0)
         
-        return tensor, scale, (pad_w, pad_h)
+        # Return scale and padding (0, 0) since we pad at bottom-right
+        return tensor, scale, (0, 0)
     
     def postprocess(
         self,
@@ -209,24 +210,41 @@ class RetinaFaceDetector:
                 - landmarks: [[x1, y1], [x2, y2], [x3, y3], [x4, y4], [x5, y5]]
         """
         # Parse outputs (model-specific)
-        # Typical RetinaFace output: [scores, boxes, landmarks]
-        scores = outputs[0]  # Shape: [N, num_anchors, 2]
-        boxes = outputs[1]   # Shape: [N, num_anchors, 4]
-        landmarks = outputs[2]  # Shape: [N, num_anchors, 10]
+        # RetinaFace outputs are separated by FPN level
+        # 3 levels: P3, P4, P5 with different numbers of anchors
         
-        # Remove batch dimension
-        scores = scores[0]
-        boxes = boxes[0]
-        landmarks = landmarks[0]
+        # The model outputs 9 tensors: 3 for scores, 3 for boxes, 3 for landmarks
+        # Each FPN level has its own outputs
+        fmc = 3  # Number of FPN levels
         
-        # Get face class scores (class 1)
-        scores = scores[:, 1]
+        # Concatenate outputs from all FPN levels
+        # But first, multiply box/landmark predictions by stride
+        scores_list = []
+        boxes_list = []
+        landmarks_list = []
+        
+        for idx, stride in enumerate(self.feature_strides):
+            # Scores
+            scores_list.append(outputs[idx])
+            
+            # Box predictions (multiply by stride for LTRB distance encoding)
+            bbox_preds = outputs[idx + fmc] * stride
+            boxes_list.append(bbox_preds)
+            
+            # Landmark predictions (multiply by stride)
+            kps_preds = outputs[idx + fmc * 2] * stride
+            landmarks_list.append(kps_preds)
+        
+        scores = np.concatenate(scores_list, axis=0)[:, 0]
+        boxes = np.concatenate(boxes_list, axis=0)
+        landmarks = np.concatenate(landmarks_list, axis=0)
         
         # Filter by confidence
         inds = np.where(scores > self.confidence_threshold)[0]
         scores = scores[inds]
         boxes = boxes[inds]
         landmarks = landmarks[inds]
+        anchor_centers_filtered = self.anchor_centers[inds]  # Filter anchors too!
         
         # Apply top_k
         if len(scores) > self.top_k:
@@ -234,15 +252,24 @@ class RetinaFaceDetector:
             scores = scores[order]
             boxes = boxes[order]
             landmarks = landmarks[order]
+            anchor_centers_filtered = anchor_centers_filtered[order]
         
-        # Decode boxes (apply anchor offsets)
-        boxes = self._decode_boxes(boxes[inds])
-        landmarks = self._decode_landmarks(landmarks[inds])
+        # Decode boxes (apply anchor offsets) using filtered anchors
+        boxes = self._decode_boxes(boxes, anchor_centers_filtered)
+        landmarks = self._decode_landmarks(landmarks, anchor_centers_filtered)
+        
+        # DEBUG: Print before adjustment
+        if self.config['debug'].get('verbose', False):
+            print(f"  Before adjustment - boxes[0]: {boxes[0] if len(boxes)>0 else 'none'}")
         
         # Adjust for padding and scale
         pad_w, pad_h = padding
         boxes = (boxes - np.array([pad_w, pad_h, pad_w, pad_h])) / scale
         landmarks = (landmarks - np.array([pad_w, pad_h] * 5)) / scale
+        
+        # DEBUG: Print after adjustment
+        if self.config['debug'].get('verbose', False):
+            print(f"  After adjustment - boxes[0]: {boxes[0] if len(boxes)>0 else 'none'}")
         
         # Clip to image boundaries
         orig_h, orig_w = orig_shape
@@ -250,6 +277,10 @@ class RetinaFaceDetector:
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h)
         landmarks[:, [0, 2, 4, 6, 8]] = np.clip(landmarks[:, [0, 2, 4, 6, 8]], 0, orig_w)
         landmarks[:, [1, 3, 5, 7, 9]] = np.clip(landmarks[:, [1, 3, 5, 7, 9]], 0, orig_h)
+        
+        # DEBUG: Print after clipping
+        if self.config['debug'].get('verbose', False):
+            print(f"  After clipping - boxes[0]: {boxes[0] if len(boxes)>0 else 'none'}")
         
         # Apply NMS
         keep = self._nms(boxes, scores, self.nms_threshold)
@@ -276,72 +307,52 @@ class RetinaFaceDetector:
         
         return detections
     
-    def _decode_boxes(self, box_deltas: np.ndarray) -> np.ndarray:
+    def _decode_boxes(self, box_deltas: np.ndarray, anchor_centers: np.ndarray) -> np.ndarray:
         """
         Decode bounding box deltas using anchors.
         
-        Box encoding (standard R-CNN style):
-        dx = (pred_x - anchor_x) / anchor_w
-        dy = (pred_y - anchor_y) / anchor_h
-        dw = log(pred_w / anchor_w)
-        dh = log(pred_h / anchor_h)
+        InsightFace RetinaFace uses LTRB (Left-Top-Right-Bottom) distance encoding:
+        - box_deltas are already multiplied by stride
+        - Format: [left_distance, top_distance, right_distance, bottom_distance]
+        - Decoding: x1 = cx - left, y1 = cy - top, x2 = cx + right, y2 = cy + bottom
         
         Args:
-            box_deltas: Predicted box offsets [N, 4]
+            box_deltas: Predicted box distances [N, 4], already scaled by stride
+            anchor_centers: Corresponding anchor centers [N, 2]
         
         Returns:
             Decoded boxes [N, 4] in [x1, y1, x2, y2] format
         """
-        # Anchor boxes [x1, y1, x2, y2]
-        anchors = self.anchors[:len(box_deltas)]
+        # LTRB distance decoding
+        x1 = anchor_centers[:, 0] - box_deltas[:, 0]
+        y1 = anchor_centers[:, 1] - box_deltas[:, 1]
+        x2 = anchor_centers[:, 0] + box_deltas[:, 2]
+        y2 = anchor_centers[:, 1] + box_deltas[:, 3]
         
-        # Convert anchors to [cx, cy, w, h]
-        anchor_w = anchors[:, 2] - anchors[:, 0]
-        anchor_h = anchors[:, 3] - anchors[:, 1]
-        anchor_cx = anchors[:, 0] + anchor_w * 0.5
-        anchor_cy = anchors[:, 1] + anchor_h * 0.5
-        
-        # Decode
-        dx, dy, dw, dh = box_deltas[:, 0], box_deltas[:, 1], box_deltas[:, 2], box_deltas[:, 3]
-        
-        pred_cx = dx * anchor_w + anchor_cx
-        pred_cy = dy * anchor_h + anchor_cy
-        pred_w = np.exp(dw) * anchor_w
-        pred_h = np.exp(dh) * anchor_h
-        
-        # Convert to [x1, y1, x2, y2]
-        boxes = np.stack([
-            pred_cx - pred_w * 0.5,
-            pred_cy - pred_h * 0.5,
-            pred_cx + pred_w * 0.5,
-            pred_cy + pred_h * 0.5
-        ], axis=1)
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
         
         return boxes
     
-    def _decode_landmarks(self, landmark_deltas: np.ndarray) -> np.ndarray:
+    def _decode_landmarks(self, landmark_deltas: np.ndarray, anchor_centers: np.ndarray) -> np.ndarray:
         """
         Decode landmark offsets using anchors.
         
+        InsightFace landmark encoding:
+        - landmark_deltas are already multiplied by stride
+        - Each landmark: px = center_x + delta_x, py = center_y + delta_y
+        
         Args:
-            landmark_deltas: Predicted landmark offsets [N, 10]
+            landmark_deltas: Predicted landmark offsets [N, 10], already scaled by stride
+            anchor_centers: Corresponding anchor centers [N, 2]
         
         Returns:
             Decoded landmarks [N, 10] in [x1, y1, x2, y2, ..., x5, y5] format
         """
-        anchors = self.anchors[:len(landmark_deltas)]
-        
-        # Anchor dimensions
-        anchor_w = anchors[:, 2] - anchors[:, 0]
-        anchor_h = anchors[:, 3] - anchors[:, 1]
-        anchor_cx = anchors[:, 0] + anchor_w * 0.5
-        anchor_cy = anchors[:, 1] + anchor_h * 0.5
-        
         # Decode each landmark point
         landmarks = np.zeros_like(landmark_deltas)
         for i in range(5):
-            landmarks[:, i*2] = landmark_deltas[:, i*2] * anchor_w + anchor_cx
-            landmarks[:, i*2+1] = landmark_deltas[:, i*2+1] * anchor_h + anchor_cy
+            landmarks[:, i*2] = anchor_centers[:, 0] + landmark_deltas[:, i*2]
+            landmarks[:, i*2+1] = anchor_centers[:, 1] + landmark_deltas[:, i*2+1]
         
         return landmarks
     

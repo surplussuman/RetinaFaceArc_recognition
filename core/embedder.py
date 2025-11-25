@@ -161,15 +161,17 @@ class ArcFaceEmbedder:
         
         return embedding
     
-    def extract_embedding(self, face: np.ndarray) -> np.ndarray:
+    def extract_embedding(self, face: np.ndarray, return_quality: bool = False):
         """
         Extract embedding from aligned face.
         
         Args:
             face: Aligned face image (BGR) [H, W, 3]
+            return_quality: If True, return dict with embedding and quality info
         
         Returns:
-            L2-normalized embedding [512]
+            If return_quality=False: L2-normalized embedding [512]
+            If return_quality=True: dict with 'embedding', 'quality', 'quality_info'
         """
         # Preprocess
         tensor = self.preprocess(face)
@@ -179,6 +181,35 @@ class ArcFaceEmbedder:
         
         # Postprocess
         embedding = self.postprocess(embedding)
+        
+        if return_quality:
+            # Check face quality
+            is_good, quality_metrics = self.check_face_quality(face)
+            
+            # Determine quality level
+            blur_score = quality_metrics.get('blur_score', 0)
+            brightness = quality_metrics.get('brightness', 0)
+            
+            if len(quality_metrics.get('issues', [])) == 0:
+                if blur_score >= self.blur_threshold * 2:
+                    quality = "EXCELLENT"
+                else:
+                    quality = "GOOD"
+            elif blur_score >= self.blur_threshold * 0.5:
+                quality = "FAIR"
+            else:
+                quality = "POOR"
+            
+            return {
+                'embedding': embedding,
+                'quality': quality,
+                'quality_info': {
+                    'blur_score': blur_score,
+                    'brightness': brightness,
+                    'quality': quality,
+                    'issues': quality_metrics.get('issues', [])
+                }
+            }
         
         return embedding
     

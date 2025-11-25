@@ -71,7 +71,7 @@ quality:
   
   # Blur detection
   check_blur: true
-  blur_threshold: 100.0  # Laplacian variance
+  blur_threshold: 15.0  # Lowered from 100.0 for old/low-quality photos (Laplacian variance)
   
   # Brightness check
   check_brightness: true
@@ -86,8 +86,7 @@ quality:
 optimization:
   # Use ONNX Runtime execution providers
   execution_providers:
-    - "CUDAExecutionProvider"
-    - "CPUExecutionProvider"
+    - "CPUExecutionProvider"  # GPU causes OOM with 4GB VRAM
   
   # CUDA options
   cuda:
