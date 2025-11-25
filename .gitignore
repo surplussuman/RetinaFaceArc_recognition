@@ -1,4 +1,4 @@
 venv/
 sampleImages/
 results/
-models/
+models/*
