@@ -2,8 +2,8 @@
 # Angular margin softmax for face recognition
 
 model:
-  name: "arcface_resnet100"
-  path: "models/arcface_resnet100.onnx"
+  name: "arcface_resnet100_int8"
+  path: "models/arcface_resnet100_int8.onnx"
   backbone: "resnet100"  # Options: resnet50, resnet100, mobilefacenet
   
   # Alternative models

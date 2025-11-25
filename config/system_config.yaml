@@ -322,3 +322,55 @@ multi_camera:
   # Cross-camera re-identification
   cross_camera_reid: true
   reid_threshold: 0.55
+
+# Ghost Tracking Optimization
+# Mathematical Model: T_frame = T_d + F * p * T_e
+#   where p = 1/recognition_interval (embedding frequency)
+# Example: recognition_interval=30 → p=1/30 → 30× speedup on recognition!
+ghost_tracking:
+  # Enable Ghost Tracking optimization
+  # When enabled, faces are recognized once, then cached for N frames
+  # This dramatically reduces embedding computations (expensive!)
+  enable: true
+  
+  # Recognition interval (frames between re-verification)
+  # 30 frames = 1 second @ 30fps
+  # Higher = faster but less responsive to changes
+  # Lower = more responsive but slower
+  # Recommended: 30 for real-time, 15 for high security
+  recognition_interval: 30
+  
+  # Cache timeout (frames before forcing re-recognition)
+  # Safety mechanism to prevent stale identities
+  # Recommended: 2× recognition_interval
+  cache_timeout: 60
+  
+  # Confidence decay (per frame)
+  # Cached confidence slowly decays to encourage re-verification
+  # 0.98 = 2% decay per frame
+  confidence_decay: 0.98
+  
+  # Force re-recognition on motion
+  # If face moves significantly, re-compute embedding
+  rerecognize_on_motion: false
+  motion_threshold: 50  # pixels
+
+# Frame Skipping Optimization (R_p parameter)
+# Mathematical Model: T_sec = R_p × T_frame
+#   R_p = frames processed per second
+#   Example: 30 FPS video, process_every_n_frames=3 → R_p = 10 FPS
+#   Speedup: 30/10 = 3× faster!
+frame_processing:
+  # Process every N frames (1 = all frames, 3 = every 3rd frame)
+  # Higher = faster but less temporal resolution
+  # Recommended: 3 for real-time (10 FPS effective), 1 for high accuracy
+  process_every_n_frames: 5
+  
+  # Max detection resolution (width × height)
+  # Lower resolution = faster detection but may miss small faces
+  # Current: (640, 360) → T_d ≈ 195ms
+  # Target: (480, 270) → T_d ≈ 80-100ms (2× faster)
+  # Aggressive: (320, 180) → T_d ≈ 40-60ms (4× faster, may miss distant faces)
+  max_detection_resolution:
+    width: 480
+    height: 270

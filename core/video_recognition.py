@@ -60,6 +60,11 @@ class FaceTrack:
         self.identity_votes = defaultdict(float)  # Track votes for each identity
         self.frames_since_seen = 0
         
+        # Ghost Tracking: Cache identity to avoid recomputing embeddings every frame
+        self.cached_identity = None  # Last recognized identity
+        self.cached_confidence = 0.0  # Confidence of cached identity
+        self.frames_since_recognition = 0  # Frames since last embedding computation
+        
     def update(self, bbox: np.ndarray, embedding: np.ndarray, frame_idx: int):
         """Update track with new detection."""
         self.bboxes.append(bbox)
@@ -111,6 +116,52 @@ class FaceTrack:
             best_identity = max(self.identity_votes, key=self.identity_votes.get)
             self.identity = best_identity
             self.identity_confidence = self.identity_votes[best_identity]
+            
+        # Update cached identity for Ghost Tracking
+        self.cached_identity = self.identity
+        self.cached_confidence = self.identity_confidence
+    
+    def should_recognize(self, recognition_interval: int) -> bool:
+        """
+        Ghost Tracking: Determine if this track needs recognition.
+        
+        Mathematical basis:
+            p = 1/recognition_interval (fraction of frames that run embedding)
+            If recognition_interval = 30: p = 1/30 → 30× speedup on recognition
+        
+        Recognition is needed if:
+        1. Track is new (never recognized before), OR
+        2. Cache is stale (>= recognition_interval frames since last recognition)
+        
+        Args:
+            recognition_interval: Frames between re-verifications (e.g. 30 = 1 sec @ 30fps)
+            
+        Returns:
+            True if embedding extraction + recognition should run
+        """
+        # New track: must recognize
+        if self.cached_identity is None:
+            return True
+        
+        # Existing track: check if cache is stale
+        return self.frames_since_recognition >= recognition_interval
+    
+    def reset_recognition_timer(self):
+        """Ghost Tracking: Reset timer after computing new embedding."""
+        self.frames_since_recognition = 0
+    
+    def increment_recognition_timer(self):
+        """Ghost Tracking: Increment timer (called every frame for cached tracks)."""
+        self.frames_since_recognition += 1
+    
+    def get_cached_identity(self) -> Tuple[Optional[str], float]:
+        """
+        Ghost Tracking: Get cached identity without re-recognition.
+        
+        Returns:
+            Tuple of (identity, confidence)
+        """
+        return (self.cached_identity, self.cached_confidence)
 
 
 class VideoRecognitionSystem:
@@ -126,7 +177,9 @@ class VideoRecognitionSystem:
                  recognition_threshold: float = 0.4,
                  track_iou_threshold: float = 0.3,
                  max_frames_missing: int = 30,
-                 process_every_n_frames: int = 1):
+                 process_every_n_frames: int = 1,
+                 enable_ghost_tracking: bool = True,
+                 recognition_interval: int = 30):
         """
         Initialize video recognition system.
         
@@ -139,6 +192,8 @@ class VideoRecognitionSystem:
             track_iou_threshold: Min IOU for track assignment (0.3 = 30% overlap)
             max_frames_missing: Max frames a track can be missing before deletion
             process_every_n_frames: Process every N frames (1 = all, 2 = every other)
+            enable_ghost_tracking: Enable Ghost Tracking optimization (p = 1/recognition_interval)
+            recognition_interval: Frames between re-recognition (30 = 1 sec @ 30fps)
         """
         self.detector = detector
         self.aligner = aligner
@@ -149,6 +204,10 @@ class VideoRecognitionSystem:
         self.max_frames_missing = max_frames_missing
         self.process_every_n_frames = process_every_n_frames
         
+        # Ghost Tracking parameters (Mathematical model: p = 1/recognition_interval)
+        self.enable_ghost_tracking = enable_ghost_tracking
+        self.recognition_interval = recognition_interval
+        
         # Performance optimization: max resolution for detection
         # For real-time CCTV on CPU: 640×360 (half HD)
         self.max_detection_resolution = (640, 360)  # Aggressive for real-time
@@ -157,11 +216,21 @@ class VideoRecognitionSystem:
         self.next_track_id = 0
         self.frame_count = 0
         
+        # Statistics for Ghost Tracking
+        self.stats = {
+            'embeddings_computed': 0,
+            'embeddings_cached': 0,
+            'total_detections': 0
+        }
+        
         print(f"✓ Video recognition system initialized")
         print(f"  Recognition threshold: {recognition_threshold}")
         print(f"  Track IOU threshold: {track_iou_threshold}")
         print(f"  Process every {process_every_n_frames} frames")
         print(f"  Max detection resolution: {self.max_detection_resolution[0]}×{self.max_detection_resolution[1]}")
+        if enable_ghost_tracking:
+            print(f"  🚀 Ghost Tracking: ENABLED (recognize every {recognition_interval} frames)")
+            print(f"     Expected speedup: ~{recognition_interval}× on recognition")
     
     def resize_for_detection(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         """
@@ -282,7 +351,17 @@ class VideoRecognitionSystem:
     
     def process_frame(self, frame: np.ndarray, frame_idx: int) -> Dict:
         """
-        Process single frame: detect, align, embed, track, recognize.
+        Process single frame with Ghost Tracking optimization.
+        
+        Mathematical Model:
+            T_frame = T_d + F * p * T_e
+            where:
+                T_d = detection time (always runs)
+                F = faces per frame
+                p = 1/recognition_interval (embedding frequency)
+                T_e = embedding time per face
+        
+        With p=1/30: Expected 30× speedup on recognition portion!
         
         Args:
             frame: BGR frame
@@ -300,16 +379,13 @@ class VideoRecognitionSystem:
                 track.frames_since_seen += 1
             return {'skipped': True, 'frame_idx': frame_idx}
         
-        # Smart resize for detection (only if frame is large)
+        # STEP 1: DETECTION (Always runs - T_d)
         detection_frame, scale = self.resize_for_detection(frame)
-        
-        # Detect faces on resized frame
         detections = self.detector.detect(detection_frame)
         
-        # Scale bboxes and landmarks back to original size if frame was resized
+        # Scale bboxes and landmarks back to original size
         if scale != 1.0:
             for detection in detections:
-                # Ensure arrays before scaling
                 bbox = detection['bbox']
                 landmarks = detection['landmarks']
                 
@@ -321,68 +397,152 @@ class VideoRecognitionSystem:
                 detection['bbox'] = bbox / scale
                 detection['landmarks'] = landmarks / scale
         
-        # Extract embeddings (BATCH PROCESSING)
-        embeddings = []
-        valid_detections = []
-        aligned_faces = []
+        # STEP 2: PRELIMINARY IOU MATCHING (Cheap - just bbox overlap)
+        # Determine which detections match existing tracks BEFORE extracting embeddings
+        preliminary_matches = []
+        matched_detections_prelim = set()
+        matched_tracks_prelim = set()
         
-        # First, align all faces
-        for detection in detections:
-            landmarks = detection['landmarks']
-            aligned_face = self.aligner.align_face(frame, landmarks)
-            if aligned_face is not None:
-                aligned_faces.append(aligned_face)
-                valid_detections.append(detection)
-        
-        # Batch extract ALL embeddings at once (FAST!)
-        if len(aligned_faces) > 0:
-            embeddings_array = self.embedder.extract_embeddings_batch(aligned_faces)
-            embeddings = list(embeddings_array) if len(embeddings_array) > 0 else []
+        if len(detections) > 0 and len(self.tracks) > 0:
+            # Compute IOU matrix between all detections and all tracks
+            iou_matrix = np.zeros((len(detections), len(self.tracks)))
             
-            # If batch failed, remove detections
-            if len(embeddings) != len(valid_detections):
-                valid_detections = valid_detections[:len(embeddings)]
+            for i, detection in enumerate(detections):
+                det_bbox = detection['bbox']
+                if isinstance(det_bbox, list):
+                    det_bbox = np.array(det_bbox)
+                
+                for j, track in enumerate(self.tracks):
+                    track_bbox = track.get_predicted_bbox()
+                    iou = self.compute_iou(det_bbox, track_bbox)
+                    iou_matrix[i, j] = iou
+            
+            # Greedy matching: highest IOU first
+            while True:
+                if iou_matrix.size == 0:
+                    break
+                    
+                max_iou = np.max(iou_matrix)
+                if max_iou < self.track_iou_threshold:
+                    break
+                
+                i, j = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+                
+                preliminary_matches.append((i, j))
+                matched_detections_prelim.add(i)
+                matched_tracks_prelim.add(j)
+                
+                iou_matrix[i, :] = 0
+                iou_matrix[:, j] = 0
         
-        # Match to tracks
-        matches = self.match_detections_to_tracks(valid_detections, embeddings)
-        matched_detection_indices = set([m[0] for m in matches])
-        matched_track_indices = set([m[1] for m in matches])
+        # STEP 3: GHOST TRACKING LOGIC - Determine which detections need embeddings
+        detections_needing_embedding = []
+        detection_to_track_map = {}  # Maps detection index to track
         
-        # Update matched tracks
-        for det_idx, track_idx in matches:
+        for det_idx, track_idx in preliminary_matches:
             track = self.tracks[track_idx]
-            track.update(
-                valid_detections[det_idx]['bbox'],
-                embeddings[det_idx],
-                frame_idx
-            )
             
-            # Recognize using averaged embedding
-            avg_embedding = track.get_average_embedding()
-            identity, confidence = self.recognize_face(avg_embedding)
-            
-            if identity is not None:
-                track.vote_identity(identity, confidence)
+            if self.enable_ghost_tracking and not track.should_recognize(self.recognition_interval):
+                # ✅ CACHE HIT: Reuse cached identity, skip expensive embedding!
+                # This is where we save time: p = 0 for this detection
+                self.stats['embeddings_cached'] += 1
+                self.stats['total_detections'] += 1
+                track.increment_recognition_timer()
+                # DON'T add to embedding list
+            else:
+                # ❌ CACHE MISS: Need to compute embedding (new track or stale cache)
+                # This costs T_e time
+                detections_needing_embedding.append(det_idx)
+                detection_to_track_map[det_idx] = track
+                self.stats['total_detections'] += 1
         
-        # Create new tracks for unmatched detections
-        for det_idx, detection in enumerate(valid_detections):
-            if det_idx not in matched_detection_indices:
+        # New detections (not matched to any track) always need embedding
+        for det_idx in range(len(detections)):
+            if det_idx not in matched_detections_prelim:
+                detections_needing_embedding.append(det_idx)
+                self.stats['total_detections'] += 1
+        
+        # STEP 4: EXTRACT EMBEDDINGS (Only for needed detections - F * p * T_e)
+        embeddings_map = {}  # Maps detection index to embedding
+        
+        if len(detections_needing_embedding) > 0:
+            # Align faces that need embeddings
+            aligned_faces = []
+            valid_det_indices = []
+            
+            for det_idx in detections_needing_embedding:
+                landmarks = detections[det_idx]['landmarks']
+                aligned_face = self.aligner.align_face(frame, landmarks)
+                if aligned_face is not None:
+                    aligned_faces.append(aligned_face)
+                    valid_det_indices.append(det_idx)
+            
+            # Batch extract embeddings (FAST!)
+            if len(aligned_faces) > 0:
+                embeddings_array = self.embedder.extract_embeddings_batch(aligned_faces)
+                for i, det_idx in enumerate(valid_det_indices):
+                    embeddings_map[det_idx] = embeddings_array[i]
+                    self.stats['embeddings_computed'] += 1
+        
+        # STEP 5: UPDATE TRACKS
+        for det_idx, track_idx in preliminary_matches:
+            track = self.tracks[track_idx]
+            detection = detections[det_idx]
+            
+            if det_idx in embeddings_map:
+                # New embedding computed - full update
+                track.update(detection['bbox'], embeddings_map[det_idx], frame_idx)
+                
+                # Recognize with averaged embedding
+                avg_embedding = track.get_average_embedding()
+                identity, confidence = self.recognize_face(avg_embedding)
+                
+                # CRITICAL: Cache result even if "Unknown" for Ghost Tracking to work!
+                if identity is not None:
+                    track.vote_identity(identity, confidence)
+                else:
+                    track.vote_identity("Unknown", 0.0)
+                
+                # Reset timer after computing new embedding
+                track.reset_recognition_timer()
+            else:
+                # Using cached identity - only update bbox, keep old embedding
+                track.bboxes.append(detection['bbox'])
+                track.last_seen = frame_idx
+                track.frames_since_seen = 0
+                # Timer already incremented in Step 3
+                # Identity stays cached - no re-recognition!
+        
+        # STEP 6: CREATE NEW TRACKS
+        for det_idx in range(len(detections)):
+            if det_idx not in matched_detections_prelim and det_idx in embeddings_map:
                 track = FaceTrack(
                     self.next_track_id,
-                    detection['bbox'],
-                    embeddings[det_idx],
+                    detections[det_idx]['bbox'],
+                    embeddings_map[det_idx],
                     frame_idx
                 )
                 self.next_track_id += 1
                 
                 # Try immediate recognition
-                identity, confidence = self.recognize_face(embeddings[det_idx])
+                identity, confidence = self.recognize_face(embeddings_map[det_idx])
+                
+                # CRITICAL: Cache result even if "Unknown"
                 if identity is not None:
                     track.vote_identity(identity, confidence)
+                else:
+                    track.vote_identity("Unknown", 0.0)
+                
+                # Reset timer for new track (just computed first embedding)
+                track.reset_recognition_timer()
                 
                 self.tracks.append(track)
         
-        # Age out and remove stale tracks
+        # STEP 7: AGE OUT STALE TRACKS
+        for track in self.tracks:
+            if track.track_id not in [self.tracks[j].track_id for _, j in preliminary_matches]:
+                track.frames_since_seen += 1
+        
         self.tracks = [
             track for track in self.tracks
             if track.frames_since_seen < self.max_frames_missing
@@ -392,7 +552,6 @@ class VideoRecognitionSystem:
         active_tracks = []
         for track in self.tracks:
             if track.frames_since_seen == 0:  # Currently visible
-                # Ensure bbox is numpy array
                 bbox = track.bboxes[-1]
                 if isinstance(bbox, list):
                     bbox = np.array(bbox)
@@ -408,7 +567,7 @@ class VideoRecognitionSystem:
         
         return {
             'frame_idx': frame_idx,
-            'num_detections': len(valid_detections),
+            'num_detections': len(detections),
             'num_tracks': len(self.tracks),
             'active_tracks': active_tracks,
             'skipped': False
@@ -581,6 +740,28 @@ class VideoRecognitionSystem:
         print(f"Avg processing time: {stats['avg_processing_time']:.1f}ms/frame")
         print(f"Total time: {total_time:.2f}s")
         print(f"Actual FPS: {stats['total_frames']/total_time:.2f}")
+        
+        # Ghost Tracking Statistics
+        if self.enable_ghost_tracking:
+            embeddings_computed = self.stats['embeddings_computed']
+            embeddings_cached = self.stats['embeddings_cached']
+            total_detections = self.stats['total_detections']
+            
+            if total_detections > 0:
+                cache_rate = (embeddings_cached / total_detections) * 100
+                expected_embeddings_no_ghost = total_detections
+                actual_speedup = expected_embeddings_no_ghost / embeddings_computed if embeddings_computed > 0 else 1.0
+                
+                print(f"\n{'-'*80}")
+                print(f"GHOST TRACKING PERFORMANCE (Mathematical Model: p = 1/{self.recognition_interval})")
+                print(f"{'-'*80}")
+                print(f"Total detections: {total_detections}")
+                print(f"Embeddings computed: {embeddings_computed}")
+                print(f"Embeddings cached: {embeddings_cached}")
+                print(f"Cache hit rate: {cache_rate:.1f}%")
+                print(f"Recognition speedup: {actual_speedup:.1f}× (expected ~{self.recognition_interval}×)")
+                print(f"{'-'*80}")
+        
         print(f"{'='*80}\n")
         
         return stats
@@ -652,29 +833,71 @@ class VideoRecognitionSystem:
 
 def create_video_recognizer(vector_db: VectorDatabase,
                             recognition_threshold: float = 0.4,
-                            process_every_n_frames: int = 1) -> VideoRecognitionSystem:
+                            process_every_n_frames: int = 1,
+                            enable_ghost_tracking: bool = True,
+                            recognition_interval: int = 30) -> VideoRecognitionSystem:
     """
     Create video recognition system with all components.
     
     Args:
         vector_db: Vector database with enrolled users
         recognition_threshold: Minimum similarity for recognition
-        process_every_n_frames: Process every N frames (1=all, 2=half, etc)
+        process_every_n_frames: Process every N frames (1=all, 2=half, 3=third, etc)
+        enable_ghost_tracking: Enable Ghost Tracking optimization (p=1/recognition_interval)
+        recognition_interval: Frames between re-recognition (30 = 1 sec @ 30fps)
         
     Returns:
         Configured VideoRecognitionSystem
     """
     print("Initializing video recognition system...")
     
+    # Load config from system_config.yaml if available
+    import yaml
+    max_detection_resolution = (640, 360)  # Default
+    
+    try:
+        config_path = Path(__file__).parent.parent / 'config' / 'system_config.yaml'
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                
+                # Ghost Tracking config
+                if 'ghost_tracking' in config:
+                    ghost_config = config['ghost_tracking']
+                    enable_ghost_tracking = ghost_config.get('enable', enable_ghost_tracking)
+                    recognition_interval = ghost_config.get('recognition_interval', recognition_interval)
+                    print(f"  Loaded Ghost Tracking config: interval={recognition_interval}")
+                
+                # Frame processing config
+                if 'frame_processing' in config:
+                    frame_config = config['frame_processing']
+                    process_every_n_frames = frame_config.get('process_every_n_frames', process_every_n_frames)
+                    
+                    if 'max_detection_resolution' in frame_config:
+                        res = frame_config['max_detection_resolution']
+                        max_detection_resolution = (res['width'], res['height'])
+                    
+                    print(f"  Loaded Frame Processing config: skip_frames={process_every_n_frames}, resolution={max_detection_resolution}")
+                    
+    except Exception as e:
+        print(f"  Warning: Could not load system_config.yaml, using defaults: {e}")
+    
     detector = RetinaFaceDetector()
     aligner = FaceAligner()
     embedder = ArcFaceEmbedder()
     
-    return VideoRecognitionSystem(
+    system = VideoRecognitionSystem(
         detector=detector,
         aligner=aligner,
         embedder=embedder,
         vector_db=vector_db,
         recognition_threshold=recognition_threshold,
-        process_every_n_frames=process_every_n_frames
+        process_every_n_frames=process_every_n_frames,
+        enable_ghost_tracking=enable_ghost_tracking,
+        recognition_interval=recognition_interval
     )
+    
+    # Update max_detection_resolution from config
+    system.max_detection_resolution = max_detection_resolution
+    
+    return system
