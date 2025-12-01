@@ -162,6 +162,9 @@ def main():
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             duration = total_frames / fps if fps > 0 else 0
+            
+            # Get first frame for zone configuration
+            ret, first_frame = cap.read()
             cap.release()
             
             col1, col2, col3, col4 = st.columns(4)
@@ -170,9 +173,137 @@ def main():
             col3.metric("Resolution", f"{width}×{height}")
             col4.metric("Duration", format_duration(duration))
             
+            # Zone Configuration Section
+            st.divider()
+            st.subheader("🎯 Detection Zone Configuration (Optional)")
+            st.markdown("**Define zones where faces are expected to speed up processing**")
+            
+            enable_zones = st.checkbox("Enable Zone-Based Detection", value=False, 
+                                      help="Process only specific regions (doors, entry points) for faster detection")
+            
+            if enable_zones:
+                # Initialize session state for zones
+                if 'zones' not in st.session_state:
+                    st.session_state.zones = []
+                
+                st.info("💡 **Tip:** Define zones at entry points, checkout counters, or doorways where faces appear")
+                
+                # Show preview frame
+                if ret and first_frame is not None:
+                    col_left, col_right = st.columns([2, 1])
+                    
+                    with col_left:
+                        st.markdown("**Preview Frame with Zones:**")
+                        
+                        # Draw zones on preview
+                        preview_frame = first_frame.copy()
+                        for i, zone in enumerate(st.session_state.zones):
+                            if zone.get('enabled', True):
+                                x, y, w, h = zone['roi']
+                                cv2.rectangle(preview_frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                                label = f"{zone['name']}"
+                                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                                cv2.rectangle(preview_frame, (x, y-label_h-15), (x+label_w+10, y), (0, 255, 0), -1)
+                                cv2.putText(preview_frame, label, (x+5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                        
+                        st.image(cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB), 
+                                caption="Green boxes show detection zones", use_container_width=True)
+                    
+                    with col_right:
+                        st.markdown("**Zone Controls:**")
+                        
+                        zone_action = st.radio("Action:", ["Add Zone", "Edit Zone", "Delete Zone"], key="zone_action")
+                        
+                        if zone_action == "Add Zone":
+                            with st.form("add_zone_form"):
+                                zone_name = st.text_input("Zone Name", value=f"Zone {len(st.session_state.zones) + 1}")
+                                
+                                x = st.number_input("X (left)", 0, width, width//4, 10)
+                                y = st.number_input("Y (top)", 0, height, height//4, 10)
+                                w = st.number_input("Width", 100, width, width//2, 10)
+                                h = st.number_input("Height", 100, height, height//2, 10)
+                                
+                                if st.form_submit_button("➕ Add Zone"):
+                                    new_zone = {
+                                        'name': zone_name,
+                                        'roi': [int(x), int(y), int(w), int(h)],
+                                        'enabled': True
+                                    }
+                                    st.session_state.zones.append(new_zone)
+                                    st.success(f"✅ Added: {zone_name}")
+                                    st.rerun()
+                        
+                        elif zone_action == "Edit Zone" and st.session_state.zones:
+                            zone_idx = st.selectbox("Select Zone:", 
+                                                   range(len(st.session_state.zones)),
+                                                   format_func=lambda i: st.session_state.zones[i]['name'])
+                            
+                            zone = st.session_state.zones[zone_idx]
+                            
+                            with st.form("edit_zone_form"):
+                                new_name = st.text_input("Zone Name", value=zone['name'])
+                                x = st.number_input("X (left)", 0, width, zone['roi'][0], 10)
+                                y = st.number_input("Y (top)", 0, height, zone['roi'][1], 10)
+                                w = st.number_input("Width", 100, width, zone['roi'][2], 10)
+                                h = st.number_input("Height", 100, height, zone['roi'][3], 10)
+                                enabled = st.checkbox("Enabled", value=zone.get('enabled', True))
+                                
+                                if st.form_submit_button("💾 Save"):
+                                    st.session_state.zones[zone_idx] = {
+                                        'name': new_name,
+                                        'roi': [int(x), int(y), int(w), int(h)],
+                                        'enabled': enabled
+                                    }
+                                    st.success(f"✅ Updated: {new_name}")
+                                    st.rerun()
+                        
+                        elif zone_action == "Delete Zone" and st.session_state.zones:
+                            zone_idx = st.selectbox("Select Zone:", 
+                                                   range(len(st.session_state.zones)),
+                                                   format_func=lambda i: st.session_state.zones[i]['name'])
+                            
+                            if st.button("🗑️ Delete", type="primary"):
+                                deleted_name = st.session_state.zones[zone_idx]['name']
+                                del st.session_state.zones[zone_idx]
+                                st.success(f"🗑️ Deleted: {deleted_name}")
+                                st.rerun()
+                        
+                        # Zone Statistics
+                        if st.session_state.zones:
+                            st.divider()
+                            st.markdown("**📊 Zone Stats:**")
+                            total_zone_pixels = sum(z['roi'][2] * z['roi'][3] for z in st.session_state.zones if z.get('enabled', True))
+                            full_frame_pixels = width * height
+                            reduction = (1 - total_zone_pixels / full_frame_pixels) * 100 if full_frame_pixels > 0 else 0
+                            
+                            st.metric("Active Zones", len([z for z in st.session_state.zones if z.get('enabled', True)]))
+                            st.metric("Pixel Reduction", f"{reduction:.1f}%")
+                            st.metric("Expected Speedup", f"{full_frame_pixels / total_zone_pixels if total_zone_pixels > 0 else 1:.1f}×")
+            
+            st.divider()
+            
             # Process button
             if st.button("🚀 Start Recognition", type="primary", disabled=st.session_state.processing):
                 st.session_state.processing = True
+                
+                # Save zones to config if enabled
+                if enable_zones and st.session_state.zones:
+                    import yaml
+                    config_path = project_root / 'config' / 'system_config.yaml'
+                    
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        config = yaml.safe_load(f)
+                    
+                    if 'camera_zone' not in config:
+                        config['camera_zone'] = {}
+                    
+                    config['camera_zone']['enabled'] = True
+                    config['camera_zone']['zones'] = st.session_state.zones
+                    
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+                    
+                    st.info(f"✅ Using {len(st.session_state.zones)} detection zone(s)")
                 
                 # Create recognizer
                 recognizer = create_video_recognizer(
