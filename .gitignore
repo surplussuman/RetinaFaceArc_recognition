@@ -2,3 +2,7 @@ venv/
 sampleImages/
 results/
 models/*
+env/
+.github/
+core/__pycache__/
+video/
