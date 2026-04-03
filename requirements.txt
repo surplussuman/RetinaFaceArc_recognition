@@ -10,8 +10,8 @@ opencv-contrib-python>=4.8.0
 Pillow>=10.0.0
 
 # Vector Database & Search
-faiss-gpu>=1.7.4
-# faiss-cpu>=1.7.4  # Use this if no GPU available
+# faiss-gpu>=1.7.4
+faiss-cpu>=1.7.4  # Use this if no GPU available
 
 # Scientific Computing
 numpy>=1.24.0
