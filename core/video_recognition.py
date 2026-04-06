@@ -42,6 +42,7 @@ from core.detector import RetinaFaceDetector
 from core.aligner import FaceAligner
 from core.embedder import ArcFaceEmbedder
 from core.vector_db import VectorDatabase
+from core.motion_detector import MotionDetector
 
 
 class FaceTrack:
@@ -181,7 +182,8 @@ class VideoRecognitionSystem:
                  enable_ghost_tracking: bool = True,
                  recognition_interval: int = 30,
                  enable_zone_detection: bool = False,
-                 detection_zones: List[Dict] = None):
+                 detection_zones: List[Dict] = None,
+                 motion_detector: Optional['MotionDetector'] = None):
         """
         Initialize video recognition system.
         
@@ -198,6 +200,7 @@ class VideoRecognitionSystem:
             recognition_interval: Frames between re-recognition (30 = 1 sec @ 30fps)
             enable_zone_detection: Enable zone-based detection (16× speedup!)
             detection_zones: List of zones [{'name': str, 'roi': [x,y,w,h], 'enabled': bool}]
+            motion_detector: Optional MotionDetector for event-driven gating
         """
         self.detector = detector
         self.aligner = aligner
@@ -216,6 +219,10 @@ class VideoRecognitionSystem:
         self.enable_zone_detection = enable_zone_detection
         self.detection_zones = detection_zones if detection_zones else []
         
+        # Motion Detection Gate (Event-Driven Architecture)
+        # Runs ~1ms/frame; gates 200ms detector to only fire on real activity
+        self.motion_detector = motion_detector
+        
         # Performance optimization: max resolution for detection
         # For real-time CCTV on CPU: 640×360 (half HD)
         self.max_detection_resolution = (640, 360)  # Aggressive for real-time
@@ -230,7 +237,9 @@ class VideoRecognitionSystem:
             'embeddings_cached': 0,
             'total_detections': 0,
             'zone_detections': 0,  # Detections inside zones
-            'total_pixels_processed': 0  # Track pixel reduction
+            'total_pixels_processed': 0,  # Track pixel reduction
+            'motion_gates_triggered': 0,   # Frames where motion caused detection
+            'motion_gates_skipped': 0,     # Frames where no motion → detection skipped
         }
         
         print(f"✓ Video recognition system initialized")
@@ -249,6 +258,10 @@ class VideoRecognitionSystem:
                     roi = zone['roi']
                     pixels = roi[2] * roi[3]
                     print(f"     - {zone['name']}: {roi[2]}×{roi[3]} = {pixels:,} pixels")
+        if motion_detector is not None:
+            print(f"  🎯 Motion Gate: ENABLED (method={motion_detector.method}, "
+                  f"warmup={motion_detector.warmup_frames}f, "
+                  f"safety_scan_every={motion_detector.safety_scan_interval}f)")
     
     def resize_for_detection(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         """
@@ -396,6 +409,38 @@ class VideoRecognitionSystem:
             for track in self.tracks:
                 track.frames_since_seen += 1
             return {'skipped': True, 'frame_idx': frame_idx}
+        
+        # MOTION GATE — run cheap motion detector before expensive face detection
+        # Cost: ~1ms. Benefit: skip 200ms detector when nothing is moving.
+        run_detection = True
+        motion_fraction = 0.0
+        if self.motion_detector is not None:
+            # Use first zone as ROI hint for motion analysis, or full frame
+            roi_hint = None
+            if self.enable_zone_detection and self.detection_zones:
+                z = next((z for z in self.detection_zones if z.get('enabled', True)), None)
+                if z:
+                    roi_hint = tuple(z['roi'])  # (x, y, w, h)
+            has_motion, _mask, _regions, motion_fraction = self.motion_detector.update(frame, roi=roi_hint)
+            run_detection = has_motion
+            if has_motion:
+                self.stats['motion_gates_triggered'] += 1
+            else:
+                self.stats['motion_gates_skipped'] += 1
+                # No detection this frame — only age tracks
+                for track in self.tracks:
+                    track.frames_since_seen += 1
+                    track.increment_recognition_timer()
+                self.tracks = [t for t in self.tracks if t.frames_since_seen < self.max_frames_missing]
+                return {
+                    'frame_idx': frame_idx,
+                    'num_detections': 0,
+                    'num_tracks': len(self.tracks),
+                    'active_tracks': [],
+                    'skipped': False,
+                    'motion_gated': True,
+                    'motion_fraction': motion_fraction,
+                }
         
         # STEP 1: ZONE-BASED DETECTION (SafePro Secret: 16× speedup!)
         # Instead of processing full 4K frame (8.3M pixels), process only active zones (518K pixels)
@@ -718,6 +763,7 @@ class VideoRecognitionSystem:
         
         frame_idx = 0
         start_time = datetime.now()
+        last_annotated_frame = None  # Persist last annotation across skipped frames
         
         try:
             while True:
@@ -736,18 +782,28 @@ class VideoRecognitionSystem:
                 stats['total_frames'] += 1
                 stats['processing_times'].append(frame_time)
                 
-                if result['skipped']:
+                if result.get('skipped') and not result.get('motion_gated'):
                     stats['skipped_frames'] += 1
+                    # Write last annotated frame (or plain frame) to keep correct duration
+                    if writer is not None:
+                        writer.write(last_annotated_frame if last_annotated_frame is not None else frame)
+                    if show_preview and last_annotated_frame is not None:
+                        cv2.imshow('Video Recognition', last_annotated_frame)
                 else:
-                    stats['processed_frames'] += 1
-                    stats['total_detections'] += result['num_detections']
+                    if not result.get('motion_gated', False):
+                        stats['processed_frames'] += 1
+                        stats['total_detections'] += result.get('num_detections', 0)
                     
-                    # Draw annotations
-                    annotated_frame = self.draw_annotations(frame, result)
+                    # Draw annotations (even for motion-gated frames, reuse last)
+                    if result.get('motion_gated', False):
+                        annotated_frame = last_annotated_frame if last_annotated_frame is not None else frame
+                    else:
+                        annotated_frame = self.draw_annotations(frame, result)
+                        last_annotated_frame = annotated_frame
                     
                     # Log recognitions
                     timestamp = frame_idx / fps
-                    for track in result['active_tracks']:
+                    for track in result.get('active_tracks', []):
                         if track['identity'] is not None:
                             stats['recognized_identities'].add(track['identity'])
                             recognition_log.append({
@@ -758,7 +814,7 @@ class VideoRecognitionSystem:
                                 'confidence': track['confidence']
                             })
                     
-                    # Write to output video
+                    # Write to output video — always write to maintain correct duration
                     if writer is not None:
                         writer.write(annotated_frame)
                     
@@ -766,8 +822,8 @@ class VideoRecognitionSystem:
                     if frame_callback is not None:
                         frame_callback(annotated_frame, {
                             'frame': frame_idx,
-                            'detections': result['num_detections'],
-                            'tracks': result['num_tracks']
+                            'detections': result.get('num_detections', 0),
+                            'tracks': result.get('num_tracks', 0)
                         })
                     
                     # Show preview
@@ -836,6 +892,21 @@ class VideoRecognitionSystem:
                 print(f"Cache hit rate: {cache_rate:.1f}%")
                 print(f"Recognition speedup: {actual_speedup:.1f}× (expected ~{self.recognition_interval}×)")
                 print(f"{'-'*80}")
+        
+        # Motion Gate Statistics
+        if self.motion_detector is not None:
+            triggered = self.stats['motion_gates_triggered']
+            skipped = self.stats['motion_gates_skipped']
+            total_gated = triggered + skipped
+            skip_rate = (skipped / total_gated * 100) if total_gated > 0 else 0
+            print(f"\n{'-'*80}")
+            print(f"MOTION GATE PERFORMANCE (Event-Driven Architecture)")
+            print(f"{'-'*80}")
+            print(f"Frames analyzed by motion: {total_gated}")
+            print(f"Detection triggered (motion): {triggered}")
+            print(f"Detection skipped (no motion): {skipped}")
+            print(f"Detection skip rate: {skip_rate:.1f}% fewer detector runs")
+            print(f"{'-'*80}")
         
         # Zone Detection Statistics (SafePro Secret - Geometry Optimization!)
         if self.enable_zone_detection:
@@ -954,7 +1025,7 @@ class VideoRecognitionSystem:
 
 def create_video_recognizer(vector_db: VectorDatabase,
                             recognition_threshold: float = 0.4,
-                            process_every_n_frames: int = 1,
+                            process_every_n_frames: Optional[int] = None,
                             enable_ghost_tracking: bool = True,
                             recognition_interval: int = 30) -> VideoRecognitionSystem:
     """
@@ -963,7 +1034,7 @@ def create_video_recognizer(vector_db: VectorDatabase,
     Args:
         vector_db: Vector database with enrolled users
         recognition_threshold: Minimum similarity for recognition
-        process_every_n_frames: Process every N frames (1=all, 2=half, 3=third, etc)
+        process_every_n_frames: Process every N frames (None = read from config, default 1)
         enable_ghost_tracking: Enable Ghost Tracking optimization (p=1/recognition_interval)
         recognition_interval: Frames between re-recognition (30 = 1 sec @ 30fps)
         
@@ -977,6 +1048,7 @@ def create_video_recognizer(vector_db: VectorDatabase,
     max_detection_resolution = (640, 360)  # Default
     enable_zone_detection = False
     detection_zones = None
+    motion_detector = None
     
     try:
         config_path = Path(__file__).parent.parent / 'config' / 'system_config.yaml'
@@ -994,7 +1066,9 @@ def create_video_recognizer(vector_db: VectorDatabase,
                 # Frame processing config
                 if 'frame_processing' in config:
                     frame_config = config['frame_processing']
-                    process_every_n_frames = frame_config.get('process_every_n_frames', process_every_n_frames)
+                    # Only use config value when caller passed None (sentinel = "use config default")
+                    if process_every_n_frames is None:
+                        process_every_n_frames = frame_config.get('process_every_n_frames', 1)
                     
                     if 'max_detection_resolution' in frame_config:
                         res = frame_config['max_detection_resolution']
@@ -1002,7 +1076,7 @@ def create_video_recognizer(vector_db: VectorDatabase,
                     
                     print(f"  Loaded Frame Processing config: skip_frames={process_every_n_frames}, resolution={max_detection_resolution}")
                 
-                # Camera Zone config (NEW: SafePro Secret - Geometry Optimization!)
+                # Camera Zone config
                 if 'camera_zone' in config:
                     zone_config = config['camera_zone']
                     enable_zone_detection = zone_config.get('enabled', False)
@@ -1015,9 +1089,28 @@ def create_video_recognizer(vector_db: VectorDatabase,
                             if zone.get('enabled', True):
                                 w, h = zone['roi'][2], zone['roi'][3]
                                 print(f"    - {zone['name']}: {w}×{h} = {w*h:,} pixels")
+                
+                # Motion Detection config
+                if 'motion_detection' in config:
+                    md_config = config['motion_detection']
+                    if md_config.get('enable', True):
+                        motion_detector = MotionDetector(
+                            method=md_config.get('method', 'mog2'),
+                            mog2_history=md_config.get('mog2_history', 200),
+                            mog2_var_threshold=md_config.get('mog2_var_threshold', 40.0),
+                            mog2_detect_shadows=md_config.get('mog2_detect_shadows', False),
+                            warmup_frames=md_config.get('warmup_frames', 30),
+                            min_motion_area=md_config.get('min_motion_area', 500),
+                            motion_gate_threshold=md_config.get('motion_gate_threshold', 0.01),
+                            safety_scan_interval=md_config.get('safety_scan_interval', 30),
+                        )
                     
     except Exception as e:
         print(f"  Warning: Could not load system_config.yaml, using defaults: {e}")
+    
+    # Final fallback if config wasn't loaded or process_every_n_frames still None
+    if process_every_n_frames is None:
+        process_every_n_frames = 1
     
     detector = RetinaFaceDetector()
     aligner = FaceAligner()
@@ -1033,7 +1126,8 @@ def create_video_recognizer(vector_db: VectorDatabase,
         enable_ghost_tracking=enable_ghost_tracking,
         recognition_interval=recognition_interval,
         enable_zone_detection=enable_zone_detection,
-        detection_zones=detection_zones
+        detection_zones=detection_zones,
+        motion_detector=motion_detector,
     )
     
     # Update max_detection_resolution from config

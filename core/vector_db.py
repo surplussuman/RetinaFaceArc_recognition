@@ -145,8 +145,9 @@ class VectorDatabase:
             distances, indices = self.index.search(query_2d, k_actual)
             
             # Convert L2 distances to cosine similarities
-            # For L2-normalized vectors: similarity = 1 - (L2_distance² / 2)
-            similarities = 1 - (distances[0] ** 2) / 2
+            # FAISS IndexFlatL2 returns SQUARED L2 distances (d²), so:
+            # cosine_similarity = 1 - d² / 2  (NOT 1 - (d²)² / 2)
+            similarities = 1 - distances[0] / 2
             
             # Filter by threshold and prepare results
             results = []

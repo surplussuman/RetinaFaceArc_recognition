@@ -19,6 +19,9 @@ from datetime import datetime
 from core.vector_db import VectorDatabase
 from core.video_recognition import create_video_recognizer
 from core.multi_quality_enrollment import MultiQualityEnroller
+from core.detector import RetinaFaceDetector
+from core.aligner import FaceAligner
+from core.embedder import ArcFaceEmbedder
 import cv2
 
 # Page config
@@ -319,83 +322,121 @@ def main():
                 output_video = output_dir / f"output_{uploaded_file.name}"
                 output_log = output_dir / "recognition_log.csv"
                 
-                # Progress bar
+                # Progress bar — decoupled from video render (no per-frame st.image calls)
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                preview_placeholder = st.empty()
-                stats_placeholder = st.empty()
                 
-                # Callbacks for live updates
                 def update_progress(frame_idx, total_frames):
-                    progress = int((frame_idx / total_frames) * 100)
+                    progress = min(int((frame_idx / total_frames) * 100), 100)
                     progress_bar.progress(progress)
-                    status_text.text(f"Processing frame {frame_idx}/{total_frames}...")
+                    status_text.text(f"Processing frame {frame_idx}/{total_frames} …")
                 
-                def update_preview(annotated_frame, frame_stats):
-                    # Convert BGR to RGB for display
-                    rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                    preview_placeholder.image(rgb_frame, caption=f"Frame {frame_stats['frame']} - Detections: {frame_stats['detections']}, Tracks: {frame_stats['tracks']}", width="stretch")
-                
-                # Process video
-                status_text.text("Processing video...")
+                status_text.text("Processing video (offline — results will appear when done) …")
                 
                 try:
+                    # frame_callback intentionally omitted — no per-frame UI update.
+                    # This is the key fix for the 40-50s display lag:
+                    # Decoupled pipeline: process all frames first, then show results.
                     stats = recognizer.process_video(
                         video_path,
                         output_path=output_video,
                         show_preview=False,
                         max_frames=max_frames if max_frames > 0 else None,
                         progress_callback=update_progress,
-                        frame_callback=update_preview if show_preview else None
+                        frame_callback=None,
                     )
                     
                     progress_bar.progress(100)
                     status_text.text("✓ Processing complete!")
                     
                     # Save recognition log
-                    if stats['recognition_log']:
-                        df = pd.DataFrame(stats['recognition_log'])
-                        df.to_csv(output_log, index=False)
+                    recognition_log = stats.get('recognition_log', [])
+                    if recognition_log:
+                        df_log = pd.DataFrame(recognition_log)
+                        df_log.to_csv(output_log, index=False)
                     
-                    # Display results
                     st.success("✅ Video processed successfully!")
                     
-                    # Statistics
+                    # --- Statistics ---
                     st.subheader("📊 Results")
                     
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Detections", stats['total_detections'])
-                    col2.metric("Unique Tracks", stats['total_tracks'])
-                    col3.metric("Recognized", stats['total_recognized'])
+                    total_detections = stats.get('total_detections', 0)
+                    unique_tracks = stats.get('unique_tracks', 0)
+                    recognized_ids = stats.get('recognized_identities', [])
+                    avg_ms = stats.get('avg_processing_time', 0)
+                    total_frames = stats.get('total_frames', 1)
+                    processed_frames = stats.get('processed_frames', 0)
+                    import time as _time
                     
                     col1, col2, col3 = st.columns(3)
-                    col1.metric("Avg FPS", f"{stats['avg_fps']:.1f}")
-                    col2.metric("Processing Time", format_duration(stats['processing_time']))
-                    col3.metric("Unique Identities", len(stats.get('unique_identities', [])))
+                    col1.metric("Total Detections", total_detections)
+                    col2.metric("Unique Tracks", unique_tracks)
+                    col3.metric("Identified People", len(recognized_ids))
                     
-                    # Identified people
-                    if stats.get('unique_identities'):
-                        st.info(f"**Identified:** {', '.join(stats['unique_identities'])}")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Avg ms/frame", f"{avg_ms:.1f}")
+                    col2.metric("Frames Processed", processed_frames)
+                    col3.metric("Frames Total", total_frames)
                     
-                    # Recognition log
-                    if stats['recognition_log']:
+                    if recognized_ids:
+                        names = [n for n in recognized_ids if n and n != "Unknown"]
+                        if names:
+                            st.info(f"**Identified:** {', '.join(sorted(set(names)))}")
+                    
+                    # --- Event Feed (detected face snapshots) ---
+                    if recognition_log:
+                        st.subheader("👤 Detected Faces (Event Feed)")
+                        st.caption("Showing first occurrence of each unique identity.")
+                        
+                        seen_ids = set()
+                        event_faces = []
+                        cap_ev = cv2.VideoCapture(str(output_video))
+                        for entry in recognition_log:
+                            identity = entry.get('identity', 'Unknown')
+                            if identity in seen_ids or identity == 'Unknown':
+                                continue
+                            seen_ids.add(identity)
+                            # Seek to frame and grab crop
+                            cap_ev.set(cv2.CAP_PROP_POS_FRAMES, entry['frame'])
+                            ret_ev, fr_ev = cap_ev.read()
+                            event_faces.append({
+                                'identity': identity,
+                                'confidence': entry.get('confidence', 0),
+                                'timestamp': entry.get('timestamp', 0),
+                                'frame': entry['frame'],
+                                'image': fr_ev if ret_ev else None,
+                            })
+                        cap_ev.release()
+                        
+                        if event_faces:
+                            cols = st.columns(min(len(event_faces), 4))
+                            for idx, ev in enumerate(event_faces):
+                                with cols[idx % 4]:
+                                    if ev['image'] is not None:
+                                        rgb = cv2.cvtColor(ev['image'], cv2.COLOR_BGR2RGB)
+                                        st.image(rgb, caption=f"{ev['identity']} ({ev['confidence']:.2f})\n@ {ev['timestamp']:.1f}s", use_container_width=True)
+                                    else:
+                                        st.write(f"**{ev['identity']}** @ {ev['timestamp']:.1f}s")
+                    
+                    # --- Full log table ---
+                    if recognition_log:
                         st.subheader("🔍 Recognition Log")
-                        df = pd.DataFrame(stats['recognition_log'])
+                        df = pd.DataFrame(recognition_log)
                         st.dataframe(df, use_container_width=True)
                     
-                    # Download buttons
+                    # --- Downloads ---
                     st.subheader("💾 Downloads")
-                    
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        with open(output_video, 'rb') as f:
-                            st.download_button(
-                                label="⬇️ Download Annotated Video",
-                                data=f,
-                                file_name=output_video.name,
-                                mime="video/mp4"
-                            )
+                        if output_video.exists():
+                            with open(output_video, 'rb') as f:
+                                st.download_button(
+                                    label="⬇️ Download Annotated Video",
+                                    data=f,
+                                    file_name=output_video.name,
+                                    mime="video/mp4"
+                                )
                     
                     with col2:
                         if output_log.exists():
@@ -407,17 +448,22 @@ def main():
                                     mime="text/csv"
                                 )
                     
-                    # Video player
-                    st.subheader("🎬 Preview")
-                    st.video(str(output_video))
+                    # --- Video playback (after processing) ---
+                    if output_video.exists():
+                        st.subheader("🎬 Annotated Video")
+                        st.video(str(output_video))
                     
                 except Exception as e:
+                    import traceback
                     st.error(f"❌ Error processing video: {str(e)}")
+                    st.code(traceback.format_exc())
                 finally:
                     st.session_state.processing = False
-                    # Cleanup
                     if video_path.exists():
-                        video_path.unlink()
+                        try:
+                            video_path.unlink()
+                        except Exception:
+                            pass
     
     # Tab 2: Enrollment
     with tabs[1]:
@@ -443,7 +489,7 @@ def main():
         )
         
         if st.button("📝 Enroll User", type="primary") and user_id and uploaded_photos:
-            with st.spinner(f"Enrolling {user_id}..."):
+            with st.spinner(f"Enrolling {user_id}... (this may take 30-60s)"):
                 try:
                     # Save photos to temp directory
                     temp_dir = Path(tempfile.mkdtemp())
@@ -453,32 +499,50 @@ def main():
                         with open(photo_path, 'wb') as f:
                             f.write(photo.read())
                     
-                    # Enroll
-                    db_path = project_root / 'data' / 'face_database'
+                    # Use the loaded database from session state
+                    vector_db = st.session_state.database
+                    if vector_db is None:
+                        vector_db = VectorDatabase(embedding_dim=512)
+                        db_path = project_root / 'data' / 'face_database'
+                        index_path = Path(str(db_path) + '.index')
+                        if index_path.exists():
+                            vector_db.load(db_path)
                     
-                    enrollment = MultiQualityEnroller()
+                    # Initialize all required components
+                    detector = RetinaFaceDetector()
+                    aligner = FaceAligner()
+                    embedder = ArcFaceEmbedder()
+                    
+                    enrollment = MultiQualityEnroller(detector, aligner, embedder, vector_db)
                     result = enrollment.enroll_from_directory(
                         user_id=user_id,
-                        photos_directory=temp_dir,
-                        db_path=db_path
+                        directory=temp_dir,
+                        replace_existing=True,
                     )
                     
-                    # Cleanup
+                    # Cleanup temp files
                     shutil.rmtree(temp_dir)
                     
-                    # Reload database
-                    st.session_state.database = load_database()
-                    
-                    # Show results
-                    st.success(f"✅ Enrolled {user_id} successfully!")
-                    st.json({
-                        'photos_processed': result['photos_processed'],
-                        'total_embeddings': result['total_embeddings'],
-                        'embeddings_per_photo': result['embeddings_per_photo']
-                    })
+                    if result.get('success'):
+                        # Persist the updated database
+                        db_path = project_root / 'data' / 'face_database'
+                        vector_db.save(db_path)
+                        
+                        # Reload database in session state
+                        st.session_state.database = vector_db
+                        
+                        st.success(f"✅ Enrolled {user_id} successfully!")
+                        st.json({
+                            'photos_processed': result.get('num_images', 0),
+                            'total_embeddings': result.get('num_embeddings', 0),
+                        })
+                    else:
+                        st.error(f"❌ Enrollment failed: {result.get('reason', 'unknown')}")
                     
                 except Exception as e:
+                    import traceback
                     st.error(f"❌ Enrollment failed: {str(e)}")
+                    st.code(traceback.format_exc())
     
     # Tab 3: About
     with tabs[2]:
@@ -491,27 +555,24 @@ def main():
         - **Temporal Smoothing**: Averages embeddings across frames for stable identification
         - **Track-by-Detection**: IOU-based tracking maintains consistent identities
         - **CCTV Optimization**: Handles low resolution, compression artifacts, and motion blur
-        - **Adaptive Thresholding**: Automatically adjusts recognition threshold based on image quality
+        - **Motion Gate**: Event-driven detection — detector runs only when motion detected
+        - **Ghost Tracking**: Identity cached per track, embedding re-computed every 30 frames
         
         ### 🔬 Technical Details
         
-        - **Detection**: MTCNN face detector
-        - **Embedding**: ArcFace (ResNet-100, 512-dim)
-        - **Database**: FAISS for efficient similarity search
-        - **Tracking**: Exponential moving average (α=0.3) for identity voting
-        - **Recognition Threshold**: 0.4 (adjustable based on accuracy requirements)
-        
-        ### 📈 Performance
-        
-        - **Image Recognition**: 75% on 40+ year old photos
-        - **Multi-Person Support**: Tracks multiple faces simultaneously
-        - **Real-Time Capable**: Configurable frame skip for performance tuning
+        - **Detection**: RetinaFace ResNet50 (ONNX, CPU)
+        - **Embedding**: ArcFace ResNet100 (ONNX, CPU, 512-dim)
+        - **Database**: FAISS IndexFlatL2 with cosine similarity conversion
+        - **Tracking**: IOU-based track assignment + EMA identity voting (α=0.3)
+        - **Recognition Threshold**: 0.4 cosine similarity (adjustable)
         
         ### 📚 Documentation
         
-        See `TECHNICAL_DOCUMENTATION.md` for detailed mathematical foundations and performance analysis.
+        See `docs/TECHNICAL_DOCUMENTATION.md` for mathematical foundations.
+        See `docs/EVENT_DRIVEN_ARCHITECTURE_ANALYSIS.md` for architecture analysis.
         """)
 
 
 if __name__ == '__main__':
     main()
+

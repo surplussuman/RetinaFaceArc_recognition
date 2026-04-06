@@ -24,7 +24,7 @@ camera_zone:
   - 255
   - 0
   box_thickness: 3
-  enabled: true
+  enabled: false
   max_distance_outside: 200
   track_outside_zone: true
   visualize: true
@@ -61,6 +61,16 @@ ghost_tracking:
   motion_threshold: 50
   recognition_interval: 30
   rerecognize_on_motion: false
+motion_detection:
+  enable: true
+  method: mog2                  # mog2 or frame_diff
+  mog2_history: 200             # Background model history (frames)
+  mog2_var_threshold: 40        # MOG2 variance threshold (higher = less sensitive)
+  mog2_detect_shadows: false    # Shadow detection (slower)
+  warmup_frames: 30             # Frames to warm up background model before gating
+  min_motion_area: 500          # Minimum contour area to count as motion (pixels²)
+  motion_gate_threshold: 0.01   # Fraction of ROI area that must have motion to trigger detect
+  safety_scan_interval: 30      # Run full detect every N frames regardless of motion (1 FPS @ 30fps)
 logging:
   format: '[{time:YYYY-MM-DD HH:mm:ss}] {level} | {message}'
   level: INFO

@@ -255,17 +255,13 @@ class ArcFaceEmbedder:
         if len(faces) == 0:
             return np.array([])
         
-        # Preprocess all faces
-        tensors = [self.preprocess(face) for face in faces]
-        batch_tensor = np.vstack(tensors)
-        
-        # Batch inference
-        embeddings = self.session.run([self.output_name], {self.input_name: batch_tensor})[0]
-        
-        # Postprocess each embedding
+        # Process one face at a time — the ONNX model has static batch_size=1.
+        # Batching multiple faces triggers a shape mismatch warning from ONNX Runtime.
         normalized_embeddings = []
-        for emb in embeddings:
-            emb_norm = self.postprocess(emb)
+        for face in faces:
+            tensor = self.preprocess(face)
+            raw = self.session.run([self.output_name], {self.input_name: tensor})[0]
+            emb_norm = self.postprocess(raw)
             normalized_embeddings.append(emb_norm)
         
         return np.array(normalized_embeddings)

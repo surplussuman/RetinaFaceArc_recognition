@@ -2,8 +2,8 @@
 # Based on FPN multi-scale detection architecture
 
 model:
-  name: "retinaface_resnet50_int8"
-  path: "models/retinaface_resnet50_int8.onnx"
+  name: "retinaface_resnet50"
+  path: "models/retinaface_resnet50.onnx"
   backbone: "resnet50"  # Options: resnet50, mobilenet0.25
   
   # Alternative lightweight model
