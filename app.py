@@ -22,6 +22,12 @@ from core.multi_quality_enrollment import MultiQualityEnroller
 from core.detector import RetinaFaceDetector
 from core.aligner import FaceAligner
 from core.embedder import ArcFaceEmbedder
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    import av as _av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 import cv2
 
 # Page config
@@ -115,9 +121,9 @@ def main():
         skip_frames = st.slider(
             "Process Every N Frames",
             min_value=1,
-            max_value=5,
-            value=1,
-            help="Skip frames for faster processing (1 = all frames)"
+            max_value=10,
+            value=3,
+            help="Process every Nth frame — 3 = 3× faster, 5 = 5× faster"
         )
         
         show_preview = st.checkbox(
@@ -135,7 +141,7 @@ def main():
         )
     
     # Main content
-    tabs = st.tabs(["📹 Video Recognition", "➕ Enroll Users", "📊 About"])
+    tabs = st.tabs(["📹 Video Recognition", "📡 Live Stream", "➕ Enroll Users", "📊 About"])
     
     # Tab 1: Video Recognition
     with tabs[0]:
@@ -322,16 +328,22 @@ def main():
                 output_video = output_dir / f"output_{uploaded_file.name}"
                 output_log = output_dir / "recognition_log.csv"
                 
-                # Progress bar — decoupled from video render (no per-frame st.image calls)
+                # Progress bar — throttled to 1 update per 25 frames to avoid
+                # WebSocket round-trip overhead (each st.* call ≈ 30-50ms)
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+                _last_progress_update = [0]
                 
                 def update_progress(frame_idx, total_frames):
+                    # Only update Streamlit UI every 25 frames to avoid per-frame overhead
+                    if frame_idx - _last_progress_update[0] < 25 and frame_idx < total_frames:
+                        return
+                    _last_progress_update[0] = frame_idx
                     progress = min(int((frame_idx / total_frames) * 100), 100)
                     progress_bar.progress(progress)
-                    status_text.text(f"Processing frame {frame_idx}/{total_frames} …")
+                    status_text.text(f"Processing… {frame_idx}/{total_frames} frames ({progress}%)")
                 
-                status_text.text("Processing video (offline — results will appear when done) …")
+                status_text.text("Processing video (offline — results shown when done) …")
                 
                 try:
                     # frame_callback intentionally omitted — no per-frame UI update.
@@ -465,8 +477,63 @@ def main():
                         except Exception:
                             pass
     
-    # Tab 2: Enrollment
+    # Tab 2: Live Stream
     with tabs[1]:
+        st.header("Live Face Recognition Stream")
+        
+        if not WEBRTC_AVAILABLE:
+            st.error("streamlit-webrtc not installed. Run: pip install streamlit-webrtc av")
+        elif not st.session_state.database:
+            st.error("⚠️ Please enroll users first (Enroll Users tab)")
+        else:
+            st.info("📡 Webcam stream with real-time face recognition. Faces are detected and identified live.")
+            
+            col_left, col_right = st.columns([3, 1])
+            with col_right:
+                live_threshold = st.slider("Recognition Threshold", 0.2, 0.6, 0.4, 0.05, key="live_thresh")
+                live_skip = st.slider("Process Every N Frames", 1, 10, 3, key="live_skip")
+            
+            # Build recognizer reference shared across WebRTC frames
+            if 'live_recognizer' not in st.session_state or st.session_state.live_recognizer is None:
+                st.session_state.live_recognizer = create_video_recognizer(
+                    st.session_state.database,
+                    recognition_threshold=live_threshold,
+                    process_every_n_frames=live_skip,
+                )
+
+            # Capture recognizer in local variable and pass into the processor.
+            # Avoid accessing `st.session_state` from the processor thread.
+            recognizer_ref = st.session_state.live_recognizer
+
+            # VideoProcessor runs in its own thread managed by streamlit-webrtc
+            class _LiveProcessor(VideoProcessorBase):
+                def __init__(self, recognizer):
+                    self.recognizer = recognizer
+                    self.frame_count = 0
+
+                def recv(self, frame):
+                    img = frame.to_ndarray(format="bgr24")
+                    result = self.recognizer.process_frame(img, self.frame_count)
+                    self.frame_count += 1
+                    if not result.get('skipped') and not result.get('motion_gated'):
+                        img = self.recognizer.draw_annotations(img, result)
+                    return _av.VideoFrame.from_ndarray(img, format="bgr24")
+
+            with col_left:
+                webrtc_streamer(
+                    key="face-recognition-live",
+                    video_processor_factory=lambda: _LiveProcessor(recognizer_ref),
+                    rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_processing=True,
+                )
+            
+            if st.button("🔄 Reset Live Stream Recognizer"):
+                st.session_state.live_recognizer = None
+                st.rerun()
+    
+    # Tab 3: Enrollment
+    with tabs[2]:
         st.header("Enroll New Users")
         
         st.info("""
@@ -544,8 +611,8 @@ def main():
                     st.error(f"❌ Enrollment failed: {str(e)}")
                     st.code(traceback.format_exc())
     
-    # Tab 3: About
-    with tabs[2]:
+    # Tab 4: About
+    with tabs[3]:
         st.header("About This System")
         
         st.markdown("""

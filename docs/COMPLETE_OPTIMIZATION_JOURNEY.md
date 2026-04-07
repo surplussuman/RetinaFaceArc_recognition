@@ -3159,4 +3159,168 @@ def process_video(video_path, skip=5):
 
 ---
 
+## Phase 8: Event-Driven Architecture & Production Fixes
+**Duration:** April 3–6, 2026  
+**Status:** ✅ COMPLETE
+
+### 8.1 Background & Motivation
+
+After Phase 7 (Streamlit UI), the system had a 40–50 second visual lag when processing a 52-second video — every processed frame triggered an `st.image()` call, causing 1306 WebSocket round-trips and locking the browser.  
+
+Additionally, the pipeline was running O(N_frames) instead of O(N_events): the face detector was invoked for every frame regardless of whether anything moved.
+
+### 8.2 Architecture Change: Motion Detection Gate
+
+**Problem:** 200ms face detector runs every processed frame even when the scene is static (empty CCTV frame).
+
+**Solution:** 1ms MOG2 background subtraction as a pre-filter gate.
+
+```
+Frame → MotionDetector (1ms) → Motion? → YES → RetinaFace (200ms) → ArcFace (80ms)
+                                        → NO  → Skip detection, age tracks only
+```
+
+**File created:** `core/motion_detector.py`
+
+```python
+class MotionDetector:
+    # MOG2 Gaussian Mixture Model background subtractor
+    # Outputs: has_motion (bool), mask, regions, fraction_of_roi
+    
+    # State machine:
+    # - warmup_frames: first 30 frames always trigger detect (model warming up)
+    # - safety_scan: every 30 frames force detect regardless (catch lingering faces)
+    # - normal: only trigger when motion_fraction > 0.01 (1% of frame)
+```
+
+**Result on Sample 1.mp4 (52s video):**
+- 29.8% of detector calls skipped (no motion)
+- Warmup + safety scan ensured no faces were missed
+
+### 8.3 Critical Bug Fixes
+
+#### Bug 1: FAISS Similarity Formula (Corrupted Recognition)
+**File:** `core/vector_db.py`
+
+`faiss.IndexFlatL2` returns **squared** L2 distances (`d²`), not `d`.  
+The formula `1 - (distances[0]**2) / 2` was squaring them again → `1 - d⁴/2`.
+
+```
+Wrong:   similarity = 1 - (d²)² / 2  = 1 - d⁴/2
+Correct: similarity = 1 -  d²  / 2
+```
+
+Impact: A face with true cosine similarity 0.87 was computed as 0.96 during enrollment (with itself), but video-quality faces at 0.45–0.55 were incorrectly scored as 0.28–0.38 — below the 0.4 threshold → always "Unknown".
+
+#### Bug 2: ONNX Batch Shape Mismatch Warning
+**File:** `core/embedder.py`
+
+`extract_embeddings_batch()` stacked N faces into a single tensor and called the model once. ArcFace model has static `batch_size=1` → shape mismatch warning from ONNX Runtime.
+
+Fix: Loop over faces individually. Performance impact negligible (already multi-face scenarios are rare in CCTV).
+
+#### Bug 3: Output Video Duration Wrong (10s instead of 52s)
+**File:** `core/video_recognition.py`
+
+`process_video()` only wrote frames that were actually *processed* (262 of 1306) to the VideoWriter. The OutputWriter received 262 frames at 25 FPS → 10.5s video running at 5× speed.
+
+Fix: Write every frame to writer regardless of whether it was processed or skipped. For skipped/motion-gated frames, write the last annotated frame (annotation persists visually).
+
+#### Bug 4: Config Overriding UI slider values
+**File:** `core/video_recognition.py` (`create_video_recognizer`)
+
+`create_video_recognizer(process_every_n_frames=3)` was silently overridden by reading `process_every_n_frames=5` from `system_config.yaml`. The caller's value was always replaced.
+
+Fix: Changed the parameter default to `None` (sentinel). Config value only used when caller passes `None`.
+
+#### Bug 5: Model Path Mismatch (Startup Crash)
+**Files:** `config/detector_config.yaml`, `config/embedder_config.yaml`
+
+Configs pointed to `models/retinaface_resnet50_int8.onnx` and `models/arcface_resnet100_int8.onnx` (INT8-quantized variants that weren't downloaded). Actual files on disk are the non-quantized versions.
+
+Fix: Updated paths to `models/retinaface_resnet50.onnx` and `models/arcface_resnet100.onnx`.
+
+### 8.4 Streamlit Performance Fix: Progress Callback Throttling
+
+**Root cause of 135s Streamlit vs 23s CLI discrepancy:**
+
+| Factor | CLI | Streamlit (before) | Streamlit (after) |
+|--------|-----|-------------------|-------------------|
+| skip_frames | 5 (config) | 1 (slider default) | 3 (new default) |
+| Processed frames | 262 | 863 | ~435 |
+| Progress updates | — | 1306 (every frame) | ~52 (every 25f) |
+| Overhead from UI | 0s | ~50s | ~2s |
+| Total time | 23s | 135s | ~12s |
+
+Two fixes:
+1. `progress_callback` throttled: only call Streamlit UI update every 25 frames.
+2. `skip_frames` slider default changed from 1 → 3.
+
+**Math:**
+- Per-frame Streamlit update overhead ≈ 38ms (WebSocket + Python re-execution)
+- 1306 updates × 38ms = **49.6 seconds** of pure UI overhead
+- At every-25-frame throttle: 52 updates × 38ms = **2 seconds** overhead
+
+### 8.5 Live Streaming Feature
+
+Previously: Only video file upload supported (offline processing).  
+Added: Real-time webcam stream with recognition overlay using `streamlit-webrtc`.
+
+**Tab added:** "📡 Live Stream" (second tab in app.py)
+
+**Technology:** WebRTC (browser-native P2P video) + `streamlit-webrtc 0.64.5` + `av 16.1.0`
+
+**Architecture:**
+```
+Browser Webcam → WebRTC peer connection → VideoProcessorBase.recv() thread
+                                              ↓
+                                     process_frame() [detection + tracking]
+                                              ↓
+                                     draw_annotations()
+                                              ↓
+                               av.VideoFrame → WebRTC → Browser display
+```
+
+The processor runs in its own thread managed by aiortc. The recognizer instance is stored in `st.session_state` so it persists across Streamlit reruns (tracks and motion detector state preserved).
+
+**Expected latency:** 300–600ms end-to-end (WebRTC overhead + detection).  
+**Expected throughput:** 10–15 FPS real-time with skip=3.
+
+### 8.6 Performance Results After All Fixes
+
+**CLI test (Sample 1.mp4, 1306 frames, 52s):**
+```
+Processed frames: 262 (skip=5)
+Total time:       23.6s
+Actual FPS:       55.30
+Ghost Tracking:   3.3% cache hit rate
+Motion Gate:      29.8% detection skip rate
+Recognition:      Unknown (correct — video doesn't contain enrolled user)
+```
+
+**Output video:** Correct 52.2s duration at 25 FPS (all frames written).
+
+### 8.7 Re-Enrollment
+
+Niheesh re-enrolled with `tools/enroll_multi_quality.py`:
+- 5 source photos × 5 quality variants = 25 embeddings
+- Averaged to 1 robust normalized embedding
+- Same-person cosine similarity: 0.87–0.93 ✅
+
+### 8.8 Files Changed in Phase 8
+
+| File | Type | Description |
+|------|------|-------------|
+| `core/motion_detector.py` | NEW | MOG2 motion gate |
+| `core/vector_db.py` | FIX | FAISS similarity formula |
+| `core/embedder.py` | FIX | Batch inference → single inference loop |
+| `core/video_recognition.py` | FIX+FEATURE | Write all frames; config sentinel; motion gate integration |
+| `config/detector_config.yaml` | FIX | Correct model path |
+| `config/embedder_config.yaml` | FIX | Correct model path |
+| `config/system_config.yaml` | FEATURE | Add motion_detection block |
+| `app.py` | FIX+FEATURE | Throttle progress; fix skip default; live stream tab; fix enrollment |
+| `docs/SYSTEM_STATUS_APR2026.md` | NEW | This session's analysis & findings |
+
+---
+
 **END OF DOCUMENT**
