@@ -346,16 +346,37 @@ def main():
                 status_text.text("Processing video (offline — results shown when done) …")
                 
                 try:
-                    # frame_callback intentionally omitted — no per-frame UI update.
-                    # This is the key fix for the 40-50s display lag:
-                    # Decoupled pipeline: process all frames first, then show results.
+                    # If the user enabled Show Live Preview in the sidebar, provide
+                    # a throttled Streamlit `frame_callback` to display annotated
+                    # frames. Do NOT enable `show_preview` (cv2.imshow) because
+                    # that opens a native window on the server. The frame callback
+                    # is lighter and avoids per-frame UI storms by throttling.
+                    preview_placeholder = st.empty()
+                    _last_preview_update = [0]
+
+                    def _frame_callback(annotated_frame, stats_cb):
+                        # Throttle preview updates to avoid UI overload (every 5 frames)
+                        frame_idx_cb = stats_cb.get('frame', 0)
+                        if frame_idx_cb - _last_preview_update[0] < 5:
+                            return
+                        _last_preview_update[0] = frame_idx_cb
+                        try:
+                            rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                            # `use_column_width` is deprecated; use `width` instead.
+                            preview_placeholder.image(rgb, width=640)
+                        except Exception:
+                            # Don't fail processing if preview drawing errors
+                            pass
+
+                    frame_cb = _frame_callback if show_preview else None
+
                     stats = recognizer.process_video(
                         video_path,
                         output_path=output_video,
                         show_preview=False,
                         max_frames=max_frames if max_frames > 0 else None,
                         progress_callback=update_progress,
-                        frame_callback=None,
+                        frame_callback=frame_cb,
                     )
                     
                     progress_bar.progress(100)
