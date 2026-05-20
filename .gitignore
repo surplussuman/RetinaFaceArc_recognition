@@ -7,3 +7,4 @@ env/
 core/__pycache__/
 video/
 uploads/
+.env

@@ -48,7 +48,7 @@ STORAGE_DIR = str(BASE_DIR / "storage" / "images")
 EVENT_FILE = str(BASE_DIR / "storage" / "events.json")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-BACKEND = "http://127.0.0.1:8002"
+BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:9002")
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

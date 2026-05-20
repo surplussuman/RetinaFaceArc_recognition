@@ -325,5 +325,9 @@ def env_check():
         "rtsp_url": RTSP_URL,
         "mjpeg_fps": MJPEG_FPS,
         "mjpeg_quality": MJPEG_QUALITY,
+        "max_stream_width": MAX_STREAM_WIDTH,
+        "max_stream_height": MAX_STREAM_HEIGHT,
+        "backend_host": os.environ.get("BACKEND_HOST", "127.0.0.1"),
+        "backend_port": int(os.environ.get("BACKEND_PORT", "9002")),
         "status": "✓ .env loaded successfully"
     }
