@@ -2398,6 +2398,64 @@ Discrepancy: Thermal throttling and overhead (1.69× slower than theory)
 - Actual: 27.5× speedup ✅ (theory validated!)
 
 **Why not faster overall?**
+
+---
+
+### 2026-04-18 — Local dev fixes
+
+- Fixed `run_processor.py` import path so `tools/` is discoverable when running the processor script from `face_events_system/processor`.
+- Added a minimal `face_events_system/frontend/index.html` to avoid a blank page and to connect to the backend websocket (tries ports 8001 then 8000).
+- Investigated `uvicorn` bind failure: port 8000 was already bound by `Code.exe` (VS Code / Live Server), causing socket bind failures. Recommended to stop the process using port 8000 or run `uvicorn` with `--port 8001`.
+
+Files changed in this update:
+- face_events_system/processor/run_processor.py
+- face_events_system/frontend/index.html
+
+Notes / Run instructions:
+- To run backend on an alternate port: `uvicorn app:app --reload --port 8001`
+- To find process using a port on Windows: `netstat -ano | findstr 8000` and then `tasklist /FI "PID eq <PID>"`.
+
+---
+
+### 2026-04-18 — Last-week experiments (summary)
+
+Over the last week multiple alternative approaches and small projects were tried (located under `tools/`, `smartentry-ui/`, and `smartentry-web/`). None produced a decisive quality or speed win over the main pipeline; the gains were similar across experiments. Below is a concise summary of what was added and tested so it is captured in the project journey.
+
+- **New / modified scripts (tools/):**
+    - [tools/api_server.py](tools/api_server.py) — lightweight REST wrapper for recognition endpoints used for A/B tests.
+    - [tools/enroll_multi_quality.py](tools/enroll_multi_quality.py) — multi-quality enrollment (already referenced earlier; iterations here added logging and more variants).
+    - [tools/find_matching_face.py](tools/find_matching_face.py) — quick matching utility for manual validation.
+    - [tools/live_debug.py](tools/live_debug.py) — helper utilities used by the processor during debugging (face crop, viz helpers).
+    - [tools/process_video.py](tools/process_video.py) and [tools/recognition_runner.py](tools/recognition_runner.py) — alternative runners to experiment with batching, different frame-skip strategies, and different recognition intervals.
+    - [tools/quantize_models.py](tools/quantize_models.py) — model quantization helper (INT8 experiments documented earlier).
+    - [tools/test_video_system.py](tools/test_video_system.py) — automated test harness used to compare different pipelines and produce the similar metrics observed.
+
+- **Streaming / integration experiments:**
+    - [tools/ffmpeg_stream_server.py](tools/ffmpeg_stream_server.py), [tools/stream_server.py](tools/stream_server.py), [tools/webrtc_server.py](tools/webrtc_server.py) — attempted low-latency ingestion strategies (FFmpeg/WebRTC). These worked functionally but did not change recognition accuracy or end-to-end latency significantly on CPU.
+
+- **Frontend / overlay experiments:**
+    - [tools/frontend.html](tools/frontend.html) and [tools/overlay_server.py](tools/overlay_server.py) — HTML + overlay server used to prototype live annotations. Useful for visualization but not for improving model performance.
+
+- **Other helpers & servers:**
+    - [tools/web_backend.py](tools/web_backend.py), [tools/api_server.py](tools/api_server.py), [tools/stream_server.py](tools/stream_server.py) — quick integration glue used to evaluate different deployment approaches.
+
+- **SmartEntry UI / Web experiments:**
+    - `smartentry-ui/` — UI prototypes (React / Vite) for a polished operator dashboard; contains the UI code used to test notification flows and enrollment UX.
+    - `smartentry-web/` — lightweight web front-end experiments to test static hosting and client-side visualizations.
+
+Results & key insight from last-week experiments:
+
+- Multiple ingestion methods (FFmpeg, WebRTC, websocket streaming) were implemented and validated; none reduced the core compute time because detection + embedding inference remained the bottleneck on CPU.
+- Attempts to change embedding frequency, batch embeddings, and different frame-skip heuristics yielded marginal changes — the combined pipeline optimizations (ghost tracking + frame skip + quantization) remain the most effective strategy.
+- UI and overlay improvements improved operator experience and debugging speed but did not affect recognition accuracy.
+
+Files changed in this update (added to repo during experiments):
+ - [tools](tools/) (multiple scripts listed above)
+ - `smartentry-ui/` (UI prototype)
+ - `smartentry-web/` (web prototype)
+
+If you'd like, I can extract the exact metrics produced by `tools/test_video_system.py` (it logs CSV/JSON per-run) and append a short table with before/after numbers for each experiment. Marking this follow-up as optional next step.
+
 - Detection still takes 195ms per frame (untouched)
 - Recognition now only 2ms per frame (from 200ms)
 - Detection is now 90% of compute time
@@ -3323,4 +3381,238 @@ Niheesh re-enrolled with `tools/enroll_multi_quality.py`:
 
 ---
 
+## Phase 9 — Web Streaming Server (MJPEG + SSE) — April 8, 2026
+
+### 9.1 Problem Statement
+
+CLI proved the AI pipeline runs at ~24 FPS natively.  
+Streamlit ran at ~7 FPS because `T_ui ≈ 100ms` (WebSocket round-trip per frame) dwarfed `T_compute ≈ 31ms`.
+
+Root cause (mathematically):
+
+```
+T_total(Streamlit) = T_compute(31ms) + T_ui(100ms) = 131ms → 7.6 FPS
+T_total(OpenCV)    = T_compute(31ms) + T_ui(~1ms)  =  32ms → 31 FPS
+T_total(MJPEG)     = T_compute(31ms) + T_ui(~5ms)  =  36ms → 27 FPS  ✓
+```
+
+### 9.2 CLI Verification (live test results)
+
+**Mode A — OpenCV annotated preview (`tools/live_debug.py --mode preview`):**
+
+| Metric | Value |
+|--------|-------|
+| Frames | 1306 |
+| Wall time | 54.75s |
+| Actual FPS | **23.9** |
+| Avg process time | 31.6 ms/frame |
+
+**Mode B — Event popup (`tools/live_debug.py --mode events`):**
+
+| Metric | Value |
+|--------|-------|
+| Frames | 1306 |
+| Wall time | 53.07s |
+| Actual FPS | **24.6** |
+| Events fired | 2 |
+| UI work saved | **99.8%** (O(N_events) not O(N_frames)) |
+
+**Key insight:** Same AI pipeline, zero UI overhead → 24 FPS vs 7 FPS in Streamlit. The bottleneck was never the model.
+
+### 9.3 Web Streaming Solution
+
+Implemented `tools/stream_server.py` — a Flask-based MJPEG + SSE server with embedded HTML/CSS/JS UI.
+
+**Architecture (both channels active simultaneously):**
+
+```
+AI pipeline (background thread)
+     ↓                    ↓
+FrameBuffer           EventBus
+     ↓                    ↓
+MJPEG generator       SSE generator
+     ↓                    ↓
+HTTP /video_feed      HTTP /events_feed
+     ↓                    ↓
+<img> in browser      JS EventSource → face cards
+```
+
+**Mode A (preview):** Annotated MJPEG stream. Browser uses `<img src="/video_feed">` — native multipart JPEG, no JavaScript needed. GPU-accelerated by browser.
+
+**Mode B (events):** Silent AI pipeline. Face-detection events pushed via SSE as JSON with base64 face-crop embedded. O(N_events) UI cost (2 events / 1306 frames = 0.2%).
+
+**UI:** Three-tab dark-theme web app (Both / Preview / Events), live stats bar, SSE-driven face cards with confidence bar, no external CDN dependencies.
+
+### 9.4 Live Test Results (server verified)
+
+```
+python tools/stream_server.py --video "video/Sample 1.mp4" --mode both
+```
+
+API `/api/status` response after full run:
+```json
+{
+  "avg_ms":  3.2,
+  "events":  2,
+  "fps":     9.7,
+  "processed_frames": 1306,
+  "source":  "Sample 1.mp4",
+  "state":   "ended",
+  "total_frames": 1306
+}
+```
+
+- All 1306 frames processed ✓  
+- Events: 2 (matches CLI Mode B exactly) ✓  
+- Server started, MJPEG and SSE endpoints live at `http://localhost:5000` ✓  
+- `avg_ms: 3.2` — last 30 frames were motion-gated (cheap), consistent with architecture ✓
+
+**Expected browser FPS (Mode A MJPEG):** ~24–27 FPS (matches OpenCV, not Streamlit).  
+T_display ≈ 5ms (JPEG encode + localhost) vs Streamlit's 100ms.
+
+### 9.5 How to Run
+
+```powershell
+# Mode A+B combined (recommended)
+python tools\stream_server.py --video "video\Sample 1.mp4" --mode both
+
+# Events only (lowest UI cost — O(N_events))
+python tools\stream_server.py --video "video\Sample 1.mp4" --mode events
+
+# Live webcam
+python tools\stream_server.py --webcam 0 --threshold 0.35 --skip-frames 3
+
+# Then open: http://localhost:5000
+```
+
+### 9.6 Files Changed
+
+| File | Type | Description |
+|------|------|-------------|
+| `tools/live_debug.py` | NEW | CLI Mode A (OpenCV preview) + Mode B (event popup) |
+| `tools/stream_server.py` | NEW | MJPEG + SSE web server with embedded HTML/CSS/JS UI |
+| `requirements.txt` | UPDATE | Added `flask>=3.1.0` |
+| `AGENTS.md` | UPDATE | Added mandatory journey doc update rule |
+
+### 9.7 Architecture Milestone
+
+| Layer | Before | After |
+|-------|--------|-------|
+| AI pipeline | ✅ 24 FPS | ✅ 24 FPS (unchanged) |
+| Display (Streamlit) | ❌ 7 FPS | — |
+| Display (MJPEG web) | — | ✅ ~24–27 FPS |
+| Event UI (Streamlit) | ❌ O(N_frames) | — |
+| Event UI (SSE) | — | ✅ O(N_events) = 0.2% of frames |
+
+System now matches OpenCV performance in a browser. The AI model was never the bottleneck — the transport layer was.
+
+---
+
+## Phase 10 — Separated Stream + Metadata Architecture — 2026-04-21
+
+### What was done
+
+- **Root cause:** Previous pipeline treated video as data (AI encoded every frame → WebSocket → browser decode), causing detection times to climb from ~110ms to 300ms+ as I/O blocked the hot loop. This wasted 90% of CPU on transport, not AI.
+- **New architecture implemented:** Two fully independent pipelines.
+  - **Video pipeline:** RTSP → `RTSPFrameBuffer` background thread (backend reads RTSP once) → `GET /stream` MJPEG endpoint → browser `<img>` tag. Zero AI in the video path.
+  - **AI pipeline:** Processor reads RTSP independently via `cv2.VideoCapture` → runs detection + recognition → POSTs `{frame_idx, timestamp, tracks:[{bbox, identity, confidence}]}` JSON to `POST /metadata` → backend broadcasts to `WS /ws/metadata` → browser canvas draws overlay.
+  - **Events pipeline** (unchanged): one saved face-crop + POST per new track, broadcast to events sidebar.
+- **Backend (`face_events_system/backend/app.py`):** Full rewrite. Added `RTSPFrameBuffer`, `GET /stream` (MJPEG, configurable FPS/quality via env vars), `GET /stream/status`, `POST /metadata` + `WS /ws/metadata` (live per-frame metadata). Kept existing `/events` + `/ws` events pipeline. Port changed to 8002 (8000 occupied by another project's Django server).
+- **Processor (`face_events_system/processor/run_processor.py`):** Full rewrite. Added `--mode live` (RTSP, per-frame metadata, no encoding) and `--mode file` (batch, unchanged behavior). Live mode sends only ~200 bytes/frame of JSON vs. the old 20-80 KB/frame of encoded image data.
+- **Frontend (`face_events_system/frontend/index.html`):** Complete rewrite. Split layout: left = `<img id="stream">` pointing at `/stream` + `<canvas id="overlay-canvas">` with CSS `position:absolute`, right = events sidebar. Two separate WebSocket connections — `/ws` for event cards, `/ws/metadata` for live bbox overlay. Canvas auto-sizes to displayed image dimensions, scales bbox coordinates from stream resolution to display resolution. Boxes auto-expire after 2.5 s (configurable `BOX_TTL_MS`) when AI stops sending metadata.
+
+### Mathematical improvements to `core/video_recognition.py`
+
+- **Adaptive recognition threshold:** Added `compute_face_quality(aligned_face)` (Laplacian variance / 300, clamped to [0, 1]). `recognize_face()` now accepts optional `quality` param and adjusts: `adaptive_threshold = base_threshold − 0.05 × (1 − quality)`, floor at 0.30. For a very blurry face (quality=0.1) at base threshold 0.40, the adaptive threshold drops to 0.355, allowing more soft matches on degraded CCTV footage without compromising sharp-face accuracy.
+- Quality is computed alongside each batch embedding extraction (STEP 4) and stored in `quality_map[det_idx]`. Both STEP 5 (matched track update) and STEP 6 (new track creation) pass the quality value to `recognize_face()`.
+- Ghost tracking and all other pipeline logic are untouched.
+
+### Before / After
+
+| Metric | Before | After |
+|--------|--------|-------|
+| AI CPU path | detect + encode + send frame | detect only, send 200B JSON |
+| Video transport | WebSocket binary ~50 KB/frame | MJPEG raw ~5 KB/frame (independent) |
+| Effective processing | ~21 FPS on CPU | ~21 FPS on CPU (unchanged — AI is bottleneck) |
+| Browser smoothness | Choppy (detection blocks transport) | Smooth (video path never blocked by AI) |
+| Detection time | 130–200 ms/call (RetinaFace ResNet-50 CPU) | same — model unchanged |
+| CCTV blurry-face recall | base threshold hard cutoff | relaxed by up to 0.05 for low-quality faces |
+
+### Key insights
+
+- **Detection time (130–200ms) is unavoidable on CPU** for RetinaFace ResNet-50. With `skip_frames=3` the effective throughput is ~20 FPS for a 25-FPS source — near real-time. To cut detection below 30ms, switch `detector_config.yaml` to `retinaface_mobilenet.onnx` (lower accuracy on small faces).
+- **The 21.9 FPS in the test run** is total frames / wall time, not detections/sec. Detection rate is ~6.7 FPS; the frame-skip multiplier brings effective throughput to ~20 FPS.
+- **RTSP live mode setup** (requires FFmpeg + MediaMTX): `ffmpeg -re -stream_loop -1 -i video/Sample2.mp4 -c copy -f rtsp rtsp://localhost:8554/live` to push a looping test video as RTSP. Backend reads it once; processor reads it independently (two separate connections, both supported by MediaMTX).
+
+### Test results (2026-04-21)
+
+Video: `video/Sample2.mp4` (1084 frames, 25 FPS, 43.3 s)
+
+```
+Processing time: 49.55 s   (1.14× real-time on CPU)
+Effective FPS:   21.9
+Events detected: 4 (face appearances — all Unknown, enrolled user not in video)
+Event images:    saved to face_events_system/storage/images/
+Backend POST:    all 4 events broadcast successfully
+Endpoint smoke:  GET /events 200, GET /stream/status 200, POST /metadata 200, POST /events 200
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `face_events_system/backend/app.py` | Full rewrite — RTSPFrameBuffer, MJPEG stream, metadata WS |
+| `face_events_system/processor/run_processor.py` | Full rewrite — live + file mode, metadata-only live path |
+| `face_events_system/frontend/index.html` | Full rewrite — video stream + canvas overlay + events sidebar |
+| `core/video_recognition.py` | Added `compute_face_quality()` + adaptive threshold in `recognize_face()` |
+
+---
+
 **END OF DOCUMENT**
+
+---
+
+## Phase 12 — Bbox Overlay Fixed (Server-Side Drawing) + Loop Re-Detection — 2026-04-24
+
+### Root Cause Analysis
+
+- **Bbox overlay never appeared**: The canvas overlay approach required precise WebSocket timing, canvas sizing synchronization, and correct coordinate scaling — any one failure meant no boxes. Diagnosis confirmed that `post_metadata()` (timeout=0.5s) was silently failing or the WS broadcast was not reaching the browser reliably.
+- **Same face no new card on loop 2**: `seen_tracks` was a plain `set()`. Ghost tracking kept the same `track_id` alive across the video loop (ffmpeg `-stream_loop -1` is a continuous RTSP stream, no reconnect). The same `track_id` was already in `seen_tracks` → blocked for the entire run.
+- **Video is 768×432** (confirmed: `cv2.VideoCapture` frame shape = (432, 768, 3)).
+
+### What was done
+
+- **Server-side bbox drawing (backend `app.py`)**: Added `current_overlay` dict + `_overlay_lock`. `POST /metadata` now stores the latest tracks with timestamp. `_draw_overlay()` uses OpenCV to draw colored rectangles + label backgrounds directly on each MJPEG frame before encoding. Boxes persist 2.5 s (same TTL as before). Canvas overlay in frontend is now a fallback only — bboxes are baked into the video stream, making them 100% reliable.
+- **`seen_tracks` TTL (processor `run_processor.py`)**: Changed from `set()` to `dict {track_id: wall_clock_time}` with `EVENT_COOLDOWN = 30.0` seconds. Same `track_id` can fire a new event after 30 s of real time. Also clears `seen_tracks` on RTSP reconnect so faces in the new loop get fresh cards immediately.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `face_events_system/backend/app.py` | `current_overlay` + `_draw_overlay()` + draw in `_mjpeg_generator()` + store in `POST /metadata` |
+| `face_events_system/processor/run_processor.py` | `seen_tracks` dict TTL, clear on reconnect |
+
+---
+
+**END OF DOCUMENT**
+
+
+### What was done
+
+- **Canvas bbox overlay (critical fix):** Old CSS `width:100%; height:100%` made the canvas fill the entire `#video-panel` div (including black bars from letterboxing). `syncCanvasSize()` was setting the pixel buffer to display size but the style still stretched it, so bbox coordinates from the AI landed in wrong positions on screen. Fix: removed CSS `width/height` from `#overlay-canvas`, let `syncCanvasSize()` also set `canvas.style.width/height` explicitly to match the rendered `<img>` dimensions. Canvas now covers exactly the image, not the bars.
+- **Event card layout (identity always visible):** Image was `width:100%` with no height cap — a 60×80px face crop stretched to fill 260px width → ~350px tall → text below scrolled out of view. Added `max-height:110px; object-fit:cover; object-position:center 20%` so each card shows the face crop at a fixed thumbnail size with the identity label and metadata always visible below.
+- **Face crop upscaling:** `save_event_image()` in processor now detects crops narrower than 200px and upscales to 200px with `cv2.INTER_LANCZOS4` at JPEG quality 85. CCTV faces are typically 40-80px wide; without upscaling they appear as blurry postage stamps in the sidebar.
+- **Duplicate old code removed:** Old appended code block (second `save_event_image`, second `main()`, old `events_batch` approach) removed from `run_processor.py`. File trimmed from 447 lines → 313 lines.
+- **Metadata debug logging:** First 3 metadata WebSocket messages with tracks are logged to browser console so bbox coordinate space can be verified during dev.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `face_events_system/frontend/index.html` | Canvas CSS fix, event card height cap, identity label visible, debug log |
+| `face_events_system/processor/run_processor.py` | LANCZOS4 upscale in `save_event_image()`, duplicate code removed |
+
+---
+
+**END OF DOCUMENT**
+

@@ -130,6 +130,21 @@ Losing either file without the other = unusable database.
 - **Edit config YAML files** (`config/*.yaml`) for threshold/parameter changes — do not hardcode values in Python.
 - **One occurrence rule**: When using `replace_string_in_file`, include 3–5 lines of unchanged context before and after so the match is unambiguous.
 
+## Continuous Journey Documentation (MANDATORY)
+
+After completing **any non-trivial task** in a conversation — including bug fixes, new features, performance improvements, architecture changes, or live test results — **append a new dated section** to `docs/COMPLETE_OPTIMIZATION_JOURNEY.md`.
+
+**When to update:** At the end of every conversation turn that changed code, config, or produced measurable results.
+
+**Minimum entry contents:**
+- Phase / session date header
+- What was done (1–3 bullet points)
+- Before / after metrics if available
+- Key insight or lesson learned
+- Files changed (table or list)
+
+**Never skip this step**, even for small changes. The journey doc is the project's single source of truth for progress. Do not ask the user to remind you — always do it proactively.
+
 ## Docs Reference
 
 Detailed documentation is in `docs/`. Do not duplicate it here.

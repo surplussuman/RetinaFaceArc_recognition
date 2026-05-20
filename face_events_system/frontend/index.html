@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SmartEntry — Face Events</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+    /* ── header ── */
+    header { background: #1a1a2e; padding: 10px 18px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #333; }
+    header h1 { font-size: 1.1rem; color: #00d4ff; }
+    #conn-status { font-size: 0.75rem; padding: 3px 8px; border-radius: 12px; background: #444; }
+    #conn-status.ok   { background: #1a5c2e; color: #4cff80; }
+    #conn-status.bad  { background: #5c1a1a; color: #ff6060; }
+    #stream-status { font-size: 0.75rem; color: #aaa; }
+
+    /* ── main layout ── */
+    main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── video panel ── */
+    #video-panel { flex: 1; position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+    #stream-img  { max-width: 100%; max-height: 100%; display: block; object-fit: contain; }
+    /* canvas must be sized/positioned by JS to cover exactly the image, not the whole panel */
+    #overlay-canvas { position: absolute; pointer-events: none; }
+    #no-stream { color: #666; font-size: 0.85rem; text-align: center; }
+
+    /* ── events sidebar ── */
+    #events-panel { width: 260px; border-left: 1px solid #333; display: flex; flex-direction: column; overflow: hidden; background: #161616; }
+    #events-header { padding: 10px 12px; font-size: 0.8rem; color: #aaa; border-bottom: 1px solid #333; display: flex; justify-content: space-between; }
+    #events-list { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+    .evt { border: 1px solid #2a2a2a; border-radius: 6px; overflow: hidden; background: #1e1e1e; }
+    /* cap height so identity text is always visible below the image */
+    .evt img { width: 100%; max-height: 110px; display: block; object-fit: cover; object-position: center 20%; }
+    .evt-info { padding: 5px 8px; font-size: 0.8rem; color: #ccc; }
+    .evt-info .identity { font-weight: bold; font-size: 0.85rem; margin-bottom: 2px; color: #00d4ff; }
+    .evt-info .identity.unknown { color: #ff8c42; }
+    .evt-info .meta { font-size: 0.72rem; color: #888; }
+
+    /* scrollbar */
+    #events-list::-webkit-scrollbar { width: 5px; }
+    #events-list::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>SmartEntry</h1>
+  <span id="conn-status" class="bad">Connecting…</span>
+  <span id="stream-status">Stream: —</span>
+</header>
+
+<main>
+  <!-- ── Live video with canvas overlay ── -->
+  <div id="video-panel">
+    <div id="no-stream">Waiting for stream…<br><small>Backend: <code>http://localhost:8000/stream</code></small></div>
+    <img id="stream-img" style="display:none" alt="live stream" />
+    <canvas id="overlay-canvas"></canvas>
+  </div>
+
+  <!-- ── Events sidebar ── -->
+  <div id="events-panel">
+    <div id="events-header">
+      <span>Face Events</span>
+      <span id="event-count">0</span>
+    </div>
+    <div id="events-list"><p style="color:#555;font-size:0.75rem;padding:8px">No events yet.</p></div>
+  </div>
+</main>
+
+<script>
+  // ── Config ────────────────────────────────────────────────────────────────
+  const BACKEND_HOST = location.hostname || 'localhost';
+  const BACKEND_PORT = 8002;
+  const BACKEND = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
+  const WS_BASE  = `ws://${BACKEND_HOST}:${BACKEND_PORT}`;
+
+  // How many seconds to keep bbox boxes visible after last metadata update
+  const BOX_TTL_MS = 2500;
+
+  // ── DOM refs ──────────────────────────────────────────────────────────────
+  const connStatus   = document.getElementById('conn-status');
+  const streamStatus = document.getElementById('stream-status');
+  const streamImg    = document.getElementById('stream-img');
+  const noStream     = document.getElementById('no-stream');
+  const canvas       = document.getElementById('overlay-canvas');
+  const ctx          = canvas.getContext('2d');
+  const eventsList   = document.getElementById('events-list');
+  const eventCount   = document.getElementById('event-count');
+
+  let totalEvents = 0;
+
+  // ── MJPEG stream ──────────────────────────────────────────────────────────
+  // Point <img> directly at backend /stream — browser handles MJPEG natively.
+  // No frame encoding in JS, no blob URLs, zero CPU on frontend for video.
+  streamImg.src = `${BACKEND}/stream`;
+  streamImg.onload = () => {
+    streamImg.style.display = 'block';
+    noStream.style.display = 'none';
+    streamStatus.textContent = 'Stream: LIVE';
+  };
+  streamImg.onerror = () => {
+    streamStatus.textContent = 'Stream: unavailable';
+  };
+
+  // Keep canvas sized/positioned to cover EXACTLY the rendered image (not the whole panel).
+  // Without this, bboxes land in the black bars instead of on faces.
+  function syncCanvasSize() {
+    const imgR   = streamImg.getBoundingClientRect();
+    const panelR = streamImg.parentElement.getBoundingClientRect();
+    if (imgR.width > 0 && imgR.height > 0) {
+      canvas.width        = Math.round(imgR.width);
+      canvas.height       = Math.round(imgR.height);
+      canvas.style.width  = canvas.width  + 'px';
+      canvas.style.height = canvas.height + 'px';
+      canvas.style.left   = Math.round(imgR.left - panelR.left) + 'px';
+      canvas.style.top    = Math.round(imgR.top  - panelR.top)  + 'px';
+    }
+  }
+  window.addEventListener('resize', syncCanvasSize);
+  setInterval(syncCanvasSize, 1000); // also catch image load
+
+  // ── Canvas overlay ────────────────────────────────────────────────────────
+  // tracks: {track_id → {bbox, identity, confidence, expiresAt}}
+  const liveBoxes = new Map();
+
+  function drawBoxes() {
+    syncCanvasSize();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const now = Date.now();
+
+    // natural image dimensions (stream resolution)
+    const natW = streamImg.naturalWidth  || 640;
+    const natH = streamImg.naturalHeight || 360;
+    const dispW = canvas.width;
+    const dispH = canvas.height;
+    const scaleX = dispW / natW;
+    const scaleY = dispH / natH;
+
+    for (const [tid, box] of liveBoxes.entries()) {
+      if (now > box.expiresAt) { liveBoxes.delete(tid); continue; }
+
+      const [x1, y1, x2, y2] = box.bbox;
+      const known = box.identity && box.identity !== 'Unknown';
+      const color = known ? '#00ff88' : '#ff8c42';
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 2;
+      ctx.strokeRect(x1 * scaleX, y1 * scaleY, (x2 - x1) * scaleX, (y2 - y1) * scaleY);
+
+      // label background
+      const label = known
+        ? `${box.identity} ${(box.confidence * 100).toFixed(0)}%`
+        : 'Unknown';
+      ctx.font = 'bold 13px Arial';
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = color;
+      ctx.fillRect(x1 * scaleX, y1 * scaleY - 18, tw + 8, 18);
+      ctx.fillStyle = '#000';
+      ctx.fillText(label, x1 * scaleX + 4, y1 * scaleY - 4);
+    }
+
+    requestAnimationFrame(drawBoxes);
+  }
+  requestAnimationFrame(drawBoxes);
+
+  // ── WebSocket: live metadata (per-frame bbox overlay) ─────────────────────
+  let _metaDebugCount = 0;
+  function connectMetaWS() {
+    const ws = new WebSocket(`${WS_BASE}/ws/metadata`);
+    ws.onmessage = e => {
+      const payload = JSON.parse(e.data);
+      const now = Date.now();
+      // Log first 3 metadata messages so we can verify coordinates are in range
+      if (_metaDebugCount < 3 && payload.tracks && payload.tracks.length > 0) {
+        console.log('[meta]', JSON.stringify(payload.tracks[0]));
+        _metaDebugCount++;
+      }
+      for (const track of (payload.tracks || [])) {
+        liveBoxes.set(track.track_id, {
+          bbox:       track.bbox,
+          identity:   track.identity,
+          confidence: track.confidence,
+          expiresAt:  now + BOX_TTL_MS,
+        });
+      }
+    };
+    ws.onclose = () => setTimeout(connectMetaWS, 2000);
+  }
+  connectMetaWS();
+
+  // ── Events sidebar: add event card ────────────────────────────────────────
+  function addEventCard(evt) {
+    if (!evt || !evt.image) return;
+    totalEvents++;
+    eventCount.textContent = totalEvents;
+
+    // Remove placeholder
+    const ph = eventsList.querySelector('p');
+    if (ph) ph.remove();
+
+    const card = document.createElement('div');
+    card.className = 'evt';
+
+    const img = document.createElement('img');
+    img.src = `${BACKEND}/images/${evt.image}`;
+    img.onerror = () => { img.style.display = 'none'; };
+
+    const info = document.createElement('div');
+    info.className = 'evt-info';
+    const known = evt.identity && evt.identity !== 'Unknown';
+    const label = known ? evt.identity : 'Unknown';
+    const conf  = known ? ` — ${(evt.confidence * 100).toFixed(0)}%` : '';
+    info.innerHTML = `
+      <div class="identity ${known ? '' : 'unknown'}">${label}${conf}</div>
+      <div class="meta">t: ${(evt.time || 0).toFixed(2)}s &nbsp;·&nbsp; frame ${evt.frame || 0}</div>
+    `;
+
+    card.appendChild(img);
+    card.appendChild(info);
+    eventsList.prepend(card);
+
+    // keep list capped at 30 cards
+    while (eventsList.children.length > 30) eventsList.removeChild(eventsList.lastChild);
+  }
+
+  // ── WebSocket: events panel ───────────────────────────────────────────────
+  function connectEventsWS() {
+    const ws = new WebSocket(`${WS_BASE}/ws`);
+    ws.onopen = () => {
+      connStatus.textContent = 'Connected';
+      connStatus.className = 'ok';
+    };
+    ws.onmessage = e => addEventCard(JSON.parse(e.data));
+    ws.onclose  = () => {
+      connStatus.textContent = 'Reconnecting…';
+      connStatus.className = 'bad';
+      setTimeout(connectEventsWS, 2000);
+    };
+  }
+  connectEventsWS();
+
+  // ── Load existing events on startup ──────────────────────────────────────
+  (async () => {
+    try {
+      const res = await fetch(`${BACKEND}/events`);
+      if (res.ok) {
+        const list = await res.json();
+        list.reverse().forEach(addEventCard);
+      }
+    } catch (e) { /* backend not up yet */ }
+  })();
+</script>

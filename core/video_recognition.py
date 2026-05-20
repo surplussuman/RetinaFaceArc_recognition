@@ -362,22 +362,38 @@ class VideoRecognitionSystem:
         
         return matches
     
-    def recognize_face(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
+    @staticmethod
+    def compute_face_quality(aligned_face: np.ndarray) -> float:
+        """Laplacian-variance sharpness proxy, normalised to [0, 1].
+        Very blurry CCTV < 0.15, typical CCTV 0.15–0.60, sharp faces > 0.60."""
+        gray = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return float(min(1.0, lap_var / 300.0))
+
+    def recognize_face(self, embedding: np.ndarray, quality: float = 1.0) -> Tuple[Optional[str], float]:
         """
         Recognize face from embedding.
-        
+
         Args:
-            embedding: Face embedding
-            
+            embedding: Face embedding (L2-normalised 512-D)
+            quality:   Face sharpness score in [0, 1] from compute_face_quality().
+                       Threshold is relaxed by up to 0.05 for blurry/low-quality faces
+                       (CCTV footage) so that soft matches are not discarded.
+
         Returns:
             (identity, confidence) or (None, 0.0)
         """
-        results = self.vector_db.search(embedding, k=1, threshold=self.recognition_threshold)
-        
+        # Adaptive threshold: loosen by 0.05 × (1 - quality)
+        # e.g. quality=1.0 → threshold unchanged; quality=0.0 → threshold - 0.05
+        adaptive_threshold = self.recognition_threshold - 0.05 * (1.0 - quality)
+        adaptive_threshold = max(0.30, adaptive_threshold)  # hard floor
+
+        results = self.vector_db.search(embedding, k=1, threshold=adaptive_threshold)
+
         if len(results) > 0:
             identity, similarity = results[0]
             return identity, similarity
-        
+
         return None, 0.0
     
     def process_frame(self, frame: np.ndarray, frame_idx: int) -> Dict:
@@ -583,7 +599,8 @@ class VideoRecognitionSystem:
                 self.stats['total_detections'] += 1
         
         # STEP 4: EXTRACT EMBEDDINGS (Only for needed detections - F * p * T_e)
-        embeddings_map = {}  # Maps detection index to embedding
+        embeddings_map = {}   # Maps detection index to embedding
+        quality_map = {}      # Maps detection index to face quality in [0, 1]
         
         if len(detections_needing_embedding) > 0:
             # Align faces that need embeddings
@@ -602,6 +619,7 @@ class VideoRecognitionSystem:
                 embeddings_array = self.embedder.extract_embeddings_batch(aligned_faces)
                 for i, det_idx in enumerate(valid_det_indices):
                     embeddings_map[det_idx] = embeddings_array[i]
+                    quality_map[det_idx] = self.compute_face_quality(aligned_faces[i])
                     self.stats['embeddings_computed'] += 1
         
         # STEP 5: UPDATE TRACKS
@@ -613,9 +631,10 @@ class VideoRecognitionSystem:
                 # New embedding computed - full update
                 track.update(detection['bbox'], embeddings_map[det_idx], frame_idx)
                 
-                # Recognize with averaged embedding
+                # Recognize with averaged embedding (quality-adaptive threshold)
                 avg_embedding = track.get_average_embedding()
-                identity, confidence = self.recognize_face(avg_embedding)
+                q = quality_map.get(det_idx, 1.0)
+                identity, confidence = self.recognize_face(avg_embedding, quality=q)
                 
                 # CRITICAL: Cache result even if "Unknown" for Ghost Tracking to work!
                 if identity is not None:
@@ -644,8 +663,9 @@ class VideoRecognitionSystem:
                 )
                 self.next_track_id += 1
                 
-                # Try immediate recognition
-                identity, confidence = self.recognize_face(embeddings_map[det_idx])
+                # Try immediate recognition (quality-adaptive threshold)
+                q = quality_map.get(det_idx, 1.0)
+                identity, confidence = self.recognize_face(embeddings_map[det_idx], quality=q)
                 
                 # CRITICAL: Cache result even if "Unknown"
                 if identity is not None:

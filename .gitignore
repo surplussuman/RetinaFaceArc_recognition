@@ -6,3 +6,4 @@ env/
 .github/
 core/__pycache__/
 video/
+uploads/
