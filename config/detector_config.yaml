@@ -17,7 +17,8 @@ detection:
   min_face_size: 16
   
   # Confidence threshold for face detection
-  confidence_threshold: 0.7
+  # RTSP camera footage is compressed; lower threshold helps (0.4-0.6 typical)
+  confidence_threshold: 0.5
   
   # Non-Maximum Suppression
   nms:

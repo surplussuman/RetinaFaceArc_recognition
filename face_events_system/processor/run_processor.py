@@ -129,6 +129,11 @@ def run_live(source: str, threshold: float, skip_frames: int):
     seen_tracks: dict = {}
     print(f"\u2713 Connected \u2014 FPS={fps:.1f}  threshold={threshold}  skip={skip_frames}")
     print("  Press Ctrl+C to stop\n")
+    
+    # Debug logging every N frames (set DEBUG_FRAMES env to enable)
+    debug_every = int(os.environ.get("DEBUG_FRAMES", "0"))
+    if debug_every > 0:
+        print(f"  DEBUG: logging every {debug_every} frames\n")
 
     try:
         while True:
@@ -141,7 +146,18 @@ def run_live(source: str, threshold: float, skip_frames: int):
                 seen_tracks.clear()  # let faces fire again after reconnect
                 continue
 
+            # Debug: log frame info
+            if debug_every > 0 and frame_idx % debug_every == 0:
+                h, w = frame.shape[:2]
+                print(f"[frame {frame_idx}] input frame size: {w}×{h}", flush=True)
+
             result = recognizer.process_frame(frame, frame_idx)
+            
+            # Debug: log recognition result
+            if debug_every > 0 and frame_idx % debug_every == 0:
+                print(f"  result: skipped={result.get('skipped')}, "
+                      f"motion_gated={result.get('motion_gated')}, "
+                      f"tracks={len(result.get('active_tracks', []))}", flush=True)
 
             if not result.get("skipped") and not result.get("motion_gated"):
                 active = result.get("active_tracks", [])
@@ -307,7 +323,9 @@ def main():
             "For --mode file: path to video file (default video/Sample 2.mp4)."
         ),
     )
-    parser.add_argument("--threshold", type=float, default=0.4)
+    parser.add_argument("--threshold", type=float, 
+                      default=float(os.environ.get("DETECTION_THRESHOLD", "0.5")),
+                      help="Face detection confidence threshold (0.0-1.0)")
     parser.add_argument("--skip-frames", type=int, default=3)
     args = parser.parse_args()
 
