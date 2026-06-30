@@ -3684,5 +3684,166 @@ No change to recognition thresholds, ghost-tracking logic, IOU/zone coordinate m
 
 ---
 
-**END OF DOCUMENT — last updated 2026-06-30**
+## Phase 14 — The Server Is CPU-Bound, Not Parallelism-Bound: Root-Cause Found — 2026-06-30
+
+> Phase 13 unlocked all cores and built the parallelism stack. When deployed to the
+> cloud4india server it **still ran ~6× slower than the laptop**. This phase is the
+> debugging journey that found the true root cause — and it was none of the things
+> Phase 13 fixed.
+
+### The symptom
+
+Same 52 s video, identical code, CPU-only on both machines:
+
+| Machine | Detection (median) | Pipeline |
+|---------|-------------------|----------|
+| Laptop (12 cores) | ~150 ms | **25.4 FPS — real-time** |
+| Server (32 vCPU EPYC 7643) | ~850–1000 ms | never finished a clean pass |
+
+### What we tried, in order, and what each ruled out
+
+| # | Hypothesis / action | Observation | Verdict |
+|---|--------------------|-------------|---------|
+| 1 | Thread cap was still 4 (parallelism-starved) | After Phase 13, process used **2871% CPU = 28.7 cores** | ✅ cores unlocked, ❌ **no speedup** → not thread-starved |
+| 2 | CPU steal (hypervisor stealing cycles) | `top` showed **49% st** under load, but `vmstat` showed **~0% st at idle** | Steal is **load-induced**, a *symptom* of CPU capping, not the disease |
+| 3 | Oversubscription (32 threads thrash) → cap to 8 (`ONNX_INTRA_OP=8`) | Steal fell **45% → 12%**, run-queue normalised — **but detection still ~900 ms while box sat 73% idle** | ❌ Contention was never the bottleneck |
+| 4 | **Pure-compute microbenchmark** (1024² matmul, numpy BLAS, no ONNX) | **Laptop 12.5 ms vs Server 108.6 ms** | 🎯 **ROOT CAUSE: server is 8.7× slower at raw float math** |
+
+### Root cause
+
+**The cloud4india vCPU is ~8–9× slower at floating-point compute than the laptop.**
+A face-recognition pipeline is almost entirely float compute, so the server is slow
+regardless of code, threads, or config.
+
+**Why this proof is airtight:** the matmul benchmark uses numpy's **BLAS** kernel;
+ONNX uses its own independent **MLAS** kernel. They share no code. *Both* are ~6–9×
+slower on the server. When two unrelated math engines fail identically, the cause is
+beneath both of them — the **CPU / virtualization layer**, not our software.
+
+Contributing factors to the slow vCPU:
+- EPYC 7643 base ~2.3 GHz, **no turbo** in the VM (laptop turbos to ~4–5 GHz).
+- **Sustained-CPU capping** by the provider — steal sits at ~0% idle, spikes to ~45%
+  the instant we burst hard (you can *touch* 32 cores briefly but not *sustain* them).
+- Odd virtual topology (`8 sockets × 4 cores`) hurting thread/cache placement.
+- The VM also co-hosts the full web stack (gunicorn ×6, mysql, redis ×3, celery) **and
+  a stale `manage.py runserver` Django dev server running 13 days / 33 h CPU** — should
+  be killed regardless.
+
+### What worked vs what didn't
+
+**Worked (kept — correct and verified, and essential for scaling):**
+- Thread-cap env override (`ONNX_INTRA_OP`/`ONNX_INTER_OP`) — cut steal 45%→12%; good
+  hygiene on any contended host.
+- Async capture (0.5 ms I/O wait), batched embeddings (1.67×), `SharedInferenceEngine`,
+  adaptive scheduler — all verified, all real wins **on capable hardware**, and the
+  foundation for the multi-stream goal. On the **laptop** they deliver real-time 25.4 FPS.
+
+**Didn't move the server needle, and why:**
+- *None* of the parallelism work sped up the server, because the server was never
+  parallelism-limited — it is **per-core-speed-limited**. You cannot parallelize away
+  slow cores: splitting slow work across more slow cores leaves each chunk slow, and the
+  provider caps the aggregate anyway.
+
+### The honest conclusion & path forward
+
+The code is **done and correct** — proven real-time on capable hardware. The bottleneck
+is the **hardware/VM**. Two honest paths:
+
+| Path | Cost | Effect | Tradeoff |
+|------|------|--------|----------|
+| **Swap detector ResNet-50 → MobileNet0.25** | **Free** | detection ~900 ms → **~70–90 ms** even on this vCPU | slightly weaker tiny/distant-face detection; recognition accuracy unchanged |
+| Lower detector input 640 → 416/320 | Free | ~2.4–4× | misses small faces |
+| Compute-optimized CPU instance | $ | ~2–3× | still CPU |
+| GPU instance | $$ | ~20–50× | the real answer for the 300-stream goal (later) |
+
+**Recommendation:** kill the stale Django dev process; do the **free MobileNet detector
+swap** to fit the work to the slow CPU; keep **GPU on the roadmap** for multi-stream
+scale. Do not buy hardware before measuring MobileNet on this box.
+
+### Benchmark of record
+
+```
+Pure-compute (1024² f32 matmul, numpy BLAS, no ONNX):
+  Laptop : 12.5 ms/op
+  Server : 108.6 ms/op   → 8.7× slower  ← the number that explains everything
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `core/onnx_session.py` | `ONNX_INTRA_OP` / `ONNX_INTER_OP` env override (wins over config) for capping threads on a contended host without editing shared config |
+
+---
+
+## Phase 15 — Disciplined Re-Investigation: Phase 0 Diagnostic Harness — 2026-07-01
+
+> Phase 14 concluded "slow silicon" from a *multi-threaded* matmul (12.5 vs 108.6 ms,
+> 8.7×). That number is contaminated — it mixes per-core speed with thread scaling,
+> steal, and BLAS threading. Before swapping any model we built a **single-thread,
+> core-pinned** diagnostic to cleanly separate recoverable causes from genuine silicon.
+> This phase is *measurement only* — no model or accuracy change.
+
+### The plan (phased, gated)
+
+- **Phase 0 (this):** diagnose the environment; STOP and decide if a model swap is even
+  needed. Free, runs on the server.
+- **Phase 1:** free compute cuts justified by Phase 0 — BLAS/ISA fix, INT8 quant (A/B
+  flag), dynamic detector input for ROI, CPU affinity to escape the web-stack contention.
+- **Phase 2:** detector frontier — *measured* SCRFD-2.5GF vs current vs MobileNet on real
+  CCTV frames, recall bucketed by face size. Only if Phase 0 proves silicon is the wall.
+
+### What was built — `tools/diagnose_env.py`
+
+A standalone, cross-platform (Linux/Windows) report:
+1. **CPU flags inside the guest** — explicitly flags `avx2`/`fma`/`avx512f`/`avx_vnni`;
+   warns if AVX2 is masked (would alone explain the slowdown). Plus `lscpu` topology
+   (flags fragmented `8×4` sockets).
+2. **numpy BLAS backend** — `show_config`, detects reference vs OpenBLAS vs MKL, prints
+   `OPENBLAS_CORETYPE`/`OMP_NUM_THREADS`/`MKL_NUM_THREADS`.
+3. **onnxruntime** — version, providers, MLAS AVX2-dispatch inference from CPU flags.
+4. **THE decisive test** — sets `OMP/MKL/OPENBLAS_NUM_THREADS=1`, pins to one core
+   (`sched_setaffinity`), times a 2048² f32 matmul and a single detector ONNX inference
+   at `intra_op=1`. Labeled `SINGLE-THREAD matmul ms` / `SINGLE-THREAD detect ms`.
+5. **Steal/contention** — `/proc/stat` steal % at idle vs during a 4 s all-core burst;
+   top CPU processes (to catch the stale `manage.py runserver`).
+6. **Model identity** — loads the ONNX, prints I/O shapes, identifies the family.
+
+Auto-verdict: pass laptop numbers via `--baseline-matmul/--baseline-detect`; the script
+computes the **single-thread ratio** and classifies — `≤2.5×` recoverable (Phase 1
+suffices), `≤4.5×` mixed, `>4.5×` genuine silicon (Phase 2 required).
+
+### Findings already confirmed (laptop run + model load)
+
+- **Detector is SCRFD-10GF (det_10g), not RetinaFace-ResNet50.** Outputs
+  `[12800/3200/800]×[1,4,10]`, 16.9 MB, ~10 GFLOPs @ 640². The config name is a misnomer.
+  → Phase 2 drop-in is **SCRFD-2.5GF (buffalo_s det_2.5g)**, identical decode, ~4× fewer FLOPs.
+- **Detector input is already spatially dynamic** (`[1,3,'?','?']`). The config forces
+  640×640, but the model accepts any H/W → **ROI/zone cropping can cut FLOPs with no
+  re-export** (Phase 1c is a config/preprocess change).
+- **Laptop single-thread baseline (i5-12450H):** matmul **165.8 ms**, detect **251.5 ms**
+  (2048² f32 / det_10g @ intra_op=1). These are the numbers the server run is compared to.
+
+### Correction to the Phase 14 record
+
+The 8.7× figure was *multi-threaded* and therefore overstates the silicon gap. The honest
+silicon measure is the **single-thread ratio** from this harness. Phase 14's *direction*
+(fit work to the CPU / consider a lighter model) may still hold, but the **magnitude** is
+re-opened pending the server's single-thread numbers.
+
+### Status: STOPPED after Phase 0 (awaiting server run)
+
+Next action is the user running `tools/diagnose_env.py` on the server with the laptop
+baseline, then approving Phase 1 based on the recoverable-vs-silicon verdict. No pipeline,
+threshold, tracking, or model code was touched.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `tools/diagnose_env.py` | **new** — Phase 0 environment diagnostic (single-thread bench, steal, BLAS/ISA, model ID) |
+
+---
+
+**END OF DOCUMENT — last updated 2026-07-01**
 
