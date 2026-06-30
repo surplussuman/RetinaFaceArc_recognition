@@ -143,16 +143,17 @@ def main():
     successful_count = sum(1 for r in results if r['success'])
     if successful_count > 0:
         print(f"\n{'-'*80}")
-        print("NEXT STEPS:")
+        print("NEXT STEPS (A/B — no config edit needed):")
         print(f"{'-'*80}")
-        print("Update config files to use INT8 models:")
-        print("  1. config/detector_config.yaml:")
-        print("       model_path: models/retinaface_resnet50_int8.onnx")
-        print("  2. config/embedder_config.yaml:")
-        print("       model_path: models/arcface_resnet100_int8.onnx")
-        print(f"\nExpected combined speedup: 2-3× (per model)")
-        print(f"Expected combined compression: ~4× smaller")
-    
+        print("The pipeline auto-loads <model>_int8.onnx when quantization is enabled.")
+        print("Turn it ON for a run without editing any file:")
+        print("    USE_QUANTIZED_MODELS=1 python tools/diagnose_env.py --baseline-matmul 165.8 --baseline-detect 251.5")
+        print("    USE_QUANTIZED_MODELS=1 python face_events_system/processor/run_processor.py --mode file --source <vid>")
+        print("Or persist it in config/system_config.yaml:  use_quantized_models: true")
+        print(f"\n>>> MEASURE, do not assume. Zen3 has AVX2 but NOT AVX-VNNI, so dynamic-INT8")
+        print(f"    GEMM typically yields only ~1.5-2.5x (and can REGRESS accuracy). A/B with")
+        print(f"    tools/diagnose_env.py (detect ms) and tools/benchmark_detectors.py before adopting.")
+
     print(f"\n{'='*80}\n")
 
 

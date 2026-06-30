@@ -56,6 +56,20 @@ onnx_threads:
   intra_op: 0       # cores per ONNX call when auto=false; 0 = all cores
   inter_op: 0       # graph-node parallelism threads when auto=false; 0 = let ORT decide
 
+# Phase 1b — INT8 quantized models (A/B). When true, the detector/embedder load
+# <model>_int8.onnx if present (run tools/quantize_models.py first). Default off:
+# FP32 stays production until measured. Env override: USE_QUANTIZED_MODELS=1.
+# NOTE: Zen3 lacks AVX-VNNI, so expect only ~1.5-2.5x and possible accuracy drift.
+use_quantized_models: false
+
+# Phase 1d — CPU affinity. Pin the inference process to dedicated cores so ONNX
+# threads stop fighting the co-located web stack (gunicorn/mysql/redis/celery).
+# Linux only (os.sched_setaffinity); other platforms print a `taskset -c` hint.
+# Env override: CPU_AFFINITY="8-23" or "0,2,4,6". Default off.
+cpu_affinity:
+  enabled: false
+  cores: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
 frame_processing:
   max_detection_resolution:
     height: 360

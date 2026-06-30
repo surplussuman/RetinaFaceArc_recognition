@@ -22,7 +22,9 @@ import yaml
 from pathlib import Path
 import time
 
-from core.onnx_session import resolve_thread_config, configure_session_options, effective_threads
+from core.onnx_session import (
+    resolve_thread_config, configure_session_options, effective_threads, resolve_model_path,
+)
 
 
 class RetinaFaceDetector:
@@ -64,10 +66,22 @@ class RetinaFaceDetector:
         # FPN parameters
         self.feature_strides = self.config['detection']['strides']
         self.anchor_scales = self.config['detection']['scales']
-        
+
+        # Phase 1c — dynamic input (default off => exact legacy 640x640 path).
+        dyn = self.config['preprocessing'].get('dynamic_input', {}) or {}
+        self.dynamic_input = bool(dyn.get('enabled', False))
+        self.dyn_stride_multiple = int(dyn.get('stride_multiple', max(self.feature_strides)))
+        self.dyn_max_size = int(dyn.get('max_size', self.input_size[0]))
+
+        # Per-input-size anchor cache (thread-safe; detect() is called concurrently
+        # by SharedInferenceEngine across streams).
+        import threading as _threading
+        self._anchor_cache = {}
+        self._anchor_lock = _threading.Lock()
+
         # Initialize ONNX Runtime session
         self._init_session()
-        
+
         # Generate anchors
         self._generate_anchors()
         
@@ -101,9 +115,12 @@ class RetinaFaceDetector:
             self.config['optimization']['session']['graph_optimization_level']
         ]
         
+        # Phase 1b: swap to INT8 model when quantization is enabled (A/B, default off).
+        model_path = resolve_model_path(self.model_path)
+
         try:
             self.session = ort.InferenceSession(
-                self.model_path,
+                model_path,
                 sess_options=sess_options,
                 providers=providers
             )
@@ -113,96 +130,133 @@ class RetinaFaceDetector:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize ONNX session: {e}")
     
-    def _generate_anchors(self):
+    def _build_anchors(self, input_w: int, input_h: int):
         """
-        Generate anchor centers for each FPN level.
-        
+        Build anchor centers for a given input size (W, H).
+
         For RetinaFace/InsightFace det_10g model:
         - Each FPN level has 2 anchor scales
         - Anchor centers are grid points at stride intervals
-        - Total anchors: stride8(80x80x2=12800) + stride16(40x40x2=3200) + stride32(20x20x2=800) = 16800
+        - At 640x640: stride8(80x80x2=12800) + stride16(40x40x2=3200) + stride32(20x20x2=800) = 16800
+
+        Returns (anchor_centers [N,2], num_anchors_per_level list). Pure function of
+        the input size — no instance state mutated, so it is safe to call concurrently.
         """
-        self.anchor_centers = []
-        self.num_anchors_per_level = []
-        
-        for level_idx, (stride, scales) in enumerate(zip(self.feature_strides, self.anchor_scales)):
-            # Calculate feature map size
-            feat_h = self.input_size[1] // stride
-            feat_w = self.input_size[0] // stride
-            
-            # Generate anchor centers using meshgrid (InsightFace style)
-            # anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
-            anchor_centers = np.stack(np.mgrid[:feat_h, :feat_w][::-1], axis=-1).astype(np.float32)
-            anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-            
-            # For 2 anchors per location (num_anchors=2), duplicate the centers
+        centers = []
+        num_per_level = []
+        for stride, scales in zip(self.feature_strides, self.anchor_scales):
+            feat_h = input_h // stride
+            feat_w = input_w // stride
+
+            # InsightFace-style meshgrid of grid points scaled by stride.
+            ac = np.stack(np.mgrid[:feat_h, :feat_w][::-1], axis=-1).astype(np.float32)
+            ac = (ac * stride).reshape((-1, 2))
+
+            # 2 anchors per location (num_anchors=2) -> duplicate the centers.
             if len(scales) > 1:
-                anchor_centers = np.stack([anchor_centers] * len(scales), axis=1).reshape((-1, 2))
-            
-            self.num_anchors_per_level.append(len(anchor_centers))
-            self.anchor_centers.append(anchor_centers)
-        
-        self.anchor_centers = np.vstack(self.anchor_centers).astype(np.float32)
+                ac = np.stack([ac] * len(scales), axis=1).reshape((-1, 2))
+
+            num_per_level.append(len(ac))
+            centers.append(ac)
+
+        return np.vstack(centers).astype(np.float32), num_per_level
+
+    def _generate_anchors(self):
+        """Build and cache the default-size anchors (legacy behaviour)."""
+        w, h = self.input_size
+        self.anchor_centers, self.num_anchors_per_level = self._build_anchors(w, h)
+        self._anchor_cache[(w, h)] = (self.anchor_centers, self.num_anchors_per_level)
         print(f"  Generated {len(self.anchor_centers)} anchor centers across {len(self.feature_strides)} FPN levels")
         print(f"  Anchors per level: {self.num_anchors_per_level}")
-    
-    def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+
+    def _get_anchors(self, input_w: int, input_h: int):
+        """Return cached anchors for (W, H), building+caching on first use (thread-safe)."""
+        key = (input_w, input_h)
+        cached = self._anchor_cache.get(key)
+        if cached is not None:
+            return cached[0]
+        with self._anchor_lock:
+            cached = self._anchor_cache.get(key)
+            if cached is None:
+                cached = self._build_anchors(input_w, input_h)
+                self._anchor_cache[key] = cached
+        return cached[0]
+
+    def _compute_dynamic_size(self, img_w: int, img_h: int):
         """
-        Preprocess image for detection.
-        
+        Pick an input (W, H) for dynamic mode: scale so the longer side fits
+        max_size (never upscale), then round each dim UP to a stride multiple so
+        the FPN feature maps are integer-sized. Matches the frame/ROI aspect ratio
+        instead of forcing a square -> fewer wasted-padding FLOPs.
+        """
+        import math
+        m = self.dyn_stride_multiple
+        s = min(self.dyn_max_size / float(max(img_w, img_h)), 1.0)
+        tw = min(self.dyn_max_size, int(math.ceil((img_w * s) / m) * m))
+        th = min(self.dyn_max_size, int(math.ceil((img_h * s) / m) * m))
+        # Guard against zero-size for tiny crops.
+        return max(tw, m), max(th, m)
+    
+    def _preprocess(self, image: np.ndarray, target_size: Tuple[int, int]):
+        """
+        Preprocess image for detection at an explicit (target_w, target_h).
+
         Matches InsightFace preprocessing:
         - Resize maintaining aspect ratio
-        - Pad to target size (padding at bottom-right, not centered)
+        - Pad to target size (top-left alignment)
         - Normalize with mean=127.5, std=128.0
-        
-        Args:
-            image: Input image (BGR format)
-        
-        Returns:
-            - Preprocessed image tensor
-            - Scale factor
-            - Padding (pad_w, pad_h) - always (0, 0) for top-left padding
+
+        Returns (tensor [1,3,th,tw], scale, padding (0,0), (target_w, target_h)).
         """
         img_h, img_w = image.shape[:2]
-        target_w, target_h = self.input_size
-        
+        target_w, target_h = target_size
+
         # Calculate resize scale (maintain aspect ratio)
         im_ratio = float(img_h) / img_w
         model_ratio = float(target_h) / target_w
-        
+
         if im_ratio > model_ratio:
             new_height = target_h
             new_width = int(new_height / im_ratio)
         else:
             new_width = target_w
             new_height = int(new_width * im_ratio)
-        
+
         scale = float(new_height) / img_h
-        
+
         # Resize image
         resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-        
+
         # Pad to target size (InsightFace style - top-left alignment)
         padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
         padded[:new_height, :new_width] = resized
-        
+
         # Normalize (note: InsightFace uses RGB order in blobFromImage with swapRB=True)
         # This is equivalent to: (BGR_pixel - 127.5) / 128.0 in BGR order
         normalized = (padded.astype(np.float32) - self.mean) / self.std
-        
+
         # Transpose to CHW format and add batch dimension
         tensor = np.transpose(normalized, (2, 0, 1))
         tensor = np.expand_dims(tensor, axis=0)
-        
-        # Return scale and padding (0, 0) since we pad at bottom-right
-        return tensor, scale, (0, 0)
+
+        return tensor, scale, (0, 0), (target_w, target_h)
+
+    def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+        """
+        Backward-compatible preprocess (always the fixed configured input_size).
+        Returns (tensor, scale, padding). detect() uses _preprocess directly so it
+        can pick a dynamic size and the matching anchors.
+        """
+        tensor, scale, padding, _ = self._preprocess(image, tuple(self.input_size))
+        return tensor, scale, padding
     
     def postprocess(
         self,
         outputs: List[np.ndarray],
         scale: float,
         padding: Tuple[int, int],
-        orig_shape: Tuple[int, int]
+        orig_shape: Tuple[int, int],
+        anchor_centers: Optional[np.ndarray] = None
     ) -> List[Dict]:
         """
         Post-process detection outputs.
@@ -226,6 +280,10 @@ class RetinaFaceDetector:
         # The model outputs 9 tensors: 3 for scores, 3 for boxes, 3 for landmarks
         # Each FPN level has its own outputs
         fmc = 3  # Number of FPN levels
+
+        # Anchors matching the input size used for THIS call (dynamic input). Falls
+        # back to the default-size anchors for the legacy fixed-size path.
+        anchors = self.anchor_centers if anchor_centers is None else anchor_centers
         
         # Concatenate outputs from all FPN levels
         # But first, multiply box/landmark predictions by stride
@@ -254,7 +312,7 @@ class RetinaFaceDetector:
         scores = scores[inds]
         boxes = boxes[inds]
         landmarks = landmarks[inds]
-        anchor_centers_filtered = self.anchor_centers[inds]  # Filter anchors too!
+        anchor_centers_filtered = anchors[inds]  # Filter anchors too!
         
         # Apply top_k
         if len(scores) > self.top_k:
@@ -420,16 +478,25 @@ class RetinaFaceDetector:
             List of detections with bounding boxes, confidence, and landmarks
         """
         start_time = time.time()
-        
-        # Preprocess
-        tensor, scale, padding = self.preprocess(image)
-        
+
+        # Choose input size: dynamic (match frame/ROI aspect ratio, fewer padding
+        # FLOPs) or the fixed configured size. Default off => exact legacy path.
+        if self.dynamic_input:
+            img_h, img_w = image.shape[:2]
+            target_size = self._compute_dynamic_size(img_w, img_h)
+        else:
+            target_size = tuple(self.input_size)
+
+        # Preprocess at the chosen size
+        tensor, scale, padding, input_wh = self._preprocess(image, target_size)
+
         # Inference
         outputs = self.session.run(None, {self.input_name: tensor})
-        
-        # Postprocess
+
+        # Postprocess with anchors matching the size actually fed to the model
         orig_shape = image.shape[:2]
-        detections = self.postprocess(outputs, scale, padding, orig_shape)
+        anchors = self._get_anchors(*input_wh)
+        detections = self.postprocess(outputs, scale, padding, orig_shape, anchor_centers=anchors)
         
         # Log timing
         if self.config['debug']['log_inference_time']:

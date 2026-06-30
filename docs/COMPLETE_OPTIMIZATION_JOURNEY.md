@@ -3913,5 +3913,100 @@ Phase 1 subset (1d + 1c, measure 1b) and prepare the Phase 2 SCRFD-2.5GF compari
 
 ---
 
+## Phase 17 — FLOP-Reduction Build: Dynamic Input + Quant A/B + Affinity + Detector Benchmark — 2026-07-01
+
+> Phase 16 proved the core is ~6.5× slow and only FLOP/contention reduction can help.
+> This phase implements that, strictly gated and measured. Constraints honoured: no
+> change to recognition thresholds, ghost tracking, motion gate, IOU/zone math, or the
+> `FaceTrack` class; ArcFace identity path unchanged; INT8 only behind an A/B flag; CPU-only.
+
+### Phase 1c — Dynamic detector input (the free, lossless win)
+
+The detector model input is already spatially dynamic (`[1,3,'?','?']`), but the code
+forced a square 640×640 — so a 16:9 frame wasted ~40% of its FLOPs on black padding.
+
+- `core/detector.py`: input size now matches the frame/ROI aspect ratio, rounded up to a
+  stride multiple and capped at `max_size` (`_compute_dynamic_size`). Anchors are built
+  per input size and cached thread-safely (`_build_anchors`/`_get_anchors`), so concurrent
+  `SharedInferenceEngine` calls are safe. `postprocess` takes per-call anchors. Default
+  **off** → the legacy 640×640 path is byte-for-byte unchanged (verified).
+- `config/detector_config.yaml`: `preprocessing.dynamic_input {enabled,stride_multiple,max_size}`.
+
+**Measured (laptop, det_10g, real frame 768×432):**
+
+| Path | input | detect ms | faces | recall vs static |
+|------|-------|-----------|-------|------------------|
+| static (default) | 640×640 | 145 | 1 | — (GT) |
+| dynamic | 640×384 | 89 | 1 | **100%** (IoU≥0.5) |
+
+→ **1.4–1.8× faster, zero accuracy change** (same pixels, less padding). Same ratio
+expected on the server since it's a pure FLOP cut.
+
+### Phase 1b — INT8 quantization (A/B, default OFF)
+
+- `core/onnx_session.py::resolve_model_path` — loads `<model>_int8.onnx` when
+  `use_quantized_models: true` (system_config) or `USE_QUANTIZED_MODELS=1` (env). Wired
+  into detector + embedder. `tools/quantize_models.py` produces the INT8 files (det 16→4 MB).
+- **Measured (laptop): INT8 det = 220 ms vs FP32 145 ms — SLOWER.** Confirms the Phase-0
+  caveat: Zen3/no-AVX-VNNI (and AVX2 laptops) often regress on dynamic-INT8 GEMM. Kept
+  behind a flag, default off; server A/B is the deciding test.
+
+### Phase 1d — CPU affinity (escape the web-stack contention)
+
+- `core/onnx_session.py::apply_cpu_affinity` + `cpu_affinity {enabled,cores}` in
+  system_config (env `CPU_AFFINITY="8-23"`). Applied once at `run_processor` startup
+  before any session is built. Linux `sched_setaffinity`; other OSes print a `taskset` hint.
+  Default off. Targets the measured contention (a python at 235%, gunicorn/mysql/redis/celery).
+
+### Phase 2 — Detector frontier benchmark (no default change)
+
+- `tools/benchmark_detectors.py` — compares det_10g (static + dynamic) vs SCRFD-2.5GF
+  (static + dynamic) on a folder/video of real frames. Reports median detect ms, faces/frame,
+  and a **size-bucketed recall proxy** (small <40px / medium / large) using the heaviest model
+  as ground truth — because CCTV recall loss concentrates on small/distant faces. Harness
+  verified locally (dynamic = 100% recall vs static GT).
+- `tools/download_scrfd_2.5g.py` — best-effort fetch of `det_2.5g.onnx` (stdlib only),
+  with manual fallback instructions. Run before the benchmark to include SCRFD-2.5GF.
+
+### Bonus cleanup
+
+- `configure_session_options` sets `log_severity_level=3`, silencing the benign
+  `VerifyOutputSizes` warnings from dynamic input / batched embeddings (results unaffected).
+
+### How to use on the server (A/B, measured)
+
+```
+# 1c free win — enable dynamic input, compare detect ms:
+#   set preprocessing.dynamic_input.enabled: true in detector_config.yaml, re-run processor
+# 1b quant A/B:
+USE_QUANTIZED_MODELS=1 python face_events_system/processor/run_processor.py --mode file --source <vid>
+# 1d affinity:  set cpu_affinity.enabled + cores, or CPU_AFFINITY="8-23" python ...
+# Phase 2 detector choice:
+python tools/download_scrfd_2.5g.py
+python tools/benchmark_detectors.py --video uploads/test.mp4 --num-frames 40
+```
+
+### Status: implemented + locally verified; awaiting server A/B numbers
+
+All flags default OFF — production behaviour is unchanged until the server measurements
+justify flipping each one. Expected stack on the slow vCPU: dynamic input (free ~1.5×) +
+SCRFD-2.5GF (~3-4× if small-face recall holds) → detection from ~900 ms toward ~150-250 ms.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `core/onnx_session.py` | `resolve_model_path` (INT8 A/B), `apply_cpu_affinity`, `log_severity_level=3` |
+| `core/detector.py` | dynamic input + per-call cached anchors; INT8 resolver; default path unchanged |
+| `core/embedder.py` | INT8 resolver |
+| `config/detector_config.yaml` | `dynamic_input` block |
+| `config/system_config.yaml` | `use_quantized_models`, `cpu_affinity` |
+| `face_events_system/processor/run_processor.py` | `apply_cpu_affinity()` at startup |
+| `tools/quantize_models.py` | flag-based A/B guidance |
+| `tools/benchmark_detectors.py` | **new** — size-bucketed detector comparison |
+| `tools/download_scrfd_2.5g.py` | **new** — fetch SCRFD-2.5GF |
+
+---
+
 **END OF DOCUMENT — last updated 2026-07-01**
 

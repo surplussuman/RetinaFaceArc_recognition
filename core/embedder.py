@@ -27,7 +27,9 @@ from typing import List, Optional, Tuple
 import yaml
 import time
 
-from core.onnx_session import resolve_thread_config, configure_session_options, effective_threads
+from core.onnx_session import (
+    resolve_thread_config, configure_session_options, effective_threads, resolve_model_path,
+)
 
 
 class ArcFaceEmbedder:
@@ -105,9 +107,12 @@ class ArcFaceEmbedder:
             self.config['optimization']['session']['graph_optimization_level']
         ]
         
+        # Phase 1b: swap to INT8 model when quantization is enabled (A/B, default off).
+        model_path = resolve_model_path(self.model_path)
+
         try:
             self.session = ort.InferenceSession(
-                self.model_path,
+                model_path,
                 sess_options=sess_options,
                 providers=providers
             )

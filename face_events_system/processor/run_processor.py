@@ -44,6 +44,7 @@ from core.vector_db import VectorDatabase
 from core.video_recognition import create_video_recognizer
 from core.frame_capture import FrameCaptureThread
 from core.inference_engine import SharedInferenceEngine
+from core.onnx_session import apply_cpu_affinity
 
 BASE_DIR = Path(__file__).resolve().parents[1]   # face_events_system/
 STORAGE_DIR = str(BASE_DIR / "storage" / "images")
@@ -339,6 +340,10 @@ def main():
                       help="Face detection confidence threshold (0.0-1.0)")
     parser.add_argument("--skip-frames", type=int, default=3)
     args = parser.parse_args()
+
+    # Phase 1d: pin to dedicated cores (if configured) BEFORE any ONNX session is
+    # built, so the inference threads are isolated from the co-located web stack.
+    apply_cpu_affinity()
 
     if args.mode == "live":
         source = args.source or os.environ.get("RTSP_URL", "rtsp://localhost:8554/live")
