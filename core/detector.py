@@ -13,6 +13,7 @@ Mathematical Foundation:
 - NMS: Non-Maximum Suppression with IOU threshold
 """
 
+import os
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -20,6 +21,8 @@ from typing import List, Tuple, Dict, Optional
 import yaml
 from pathlib import Path
 import time
+
+from core.onnx_session import resolve_thread_config, configure_session_options, effective_threads
 
 
 class RetinaFaceDetector:
@@ -78,9 +81,15 @@ class RetinaFaceDetector:
         providers = self.config['optimization']['execution_providers']
         
         sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = self.config['optimization']['session']['intra_op_num_threads']
-        sess_options.inter_op_num_threads = self.config['optimization']['session']['inter_op_num_threads']
-        
+
+        # Resolve thread counts: system_config.yaml -> onnx_threads overrides the
+        # per-model yaml. 0 == use all available cores (fixes 4-core utilisation cap).
+        local_intra = self.config['optimization']['session']['intra_op_num_threads']
+        local_inter = self.config['optimization']['session']['inter_op_num_threads']
+        intra_op, inter_op = resolve_thread_config(local_intra, local_inter)
+        configure_session_options(sess_options, intra_op, inter_op)
+        self._effective_threads = effective_threads(intra_op)
+
         # Graph optimization
         opt_level_map = {
             'ORT_DISABLE_ALL': ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
@@ -100,6 +109,7 @@ class RetinaFaceDetector:
             )
             self.input_name = self.session.get_inputs()[0].name
             print(f"  Execution providers: {self.session.get_providers()}")
+            print(f"  ONNX detector threads: {self._effective_threads} / {os.cpu_count()} available")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize ONNX session: {e}")
     

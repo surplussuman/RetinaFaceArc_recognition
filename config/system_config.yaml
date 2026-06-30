@@ -49,11 +49,21 @@ error_handling:
   error_log: data/logs/errors.log
   log_errors: true
   max_retries: 3
+# Central ONNX Runtime thread control (overrides detector_config / embedder_config).
+# One place to tune CPU utilisation per server. 0 = use all available cores.
+onnx_threads:
+  auto: true        # true => use all cores (0,0). Set false to use explicit values below.
+  intra_op: 0       # cores per ONNX call when auto=false; 0 = all cores
+  inter_op: 0       # graph-node parallelism threads when auto=false; 0 = let ORT decide
+
 frame_processing:
   max_detection_resolution:
     height: 360
     width: 640
-  process_every_n_frames: 5
+  # 1 = let EVERY frame reach the adaptive motion gate (recommended when
+  # motion_detection.enable is true). The motion gate is the real sampler now;
+  # a fixed skip here just blinds it and drops faces (349->111 in benchmarks).
+  process_every_n_frames: 1
 ghost_tracking:
   cache_timeout: 60
   confidence_decay: 0.98
@@ -70,7 +80,14 @@ motion_detection:
   warmup_frames: 30             # Frames to warm up background model before gating
   min_motion_area: 500          # Minimum contour area to count as motion (pixels²)
   motion_gate_threshold: 0.01   # Fraction of ROI area that must have motion to trigger detect
-  safety_scan_interval: 30      # Run full detect every N frames regardless of motion (1 FPS @ 30fps)
+  safety_scan_interval: 30      # FLOOR: force detect every N frames regardless of motion (1 FPS @ 30fps)
+  # --- Adaptive detection scheduler (replaces fixed frame-skip) ---
+  detect_min_interval: 3        # CEILING: under sustained motion, detector runs at most once
+                                # per N frames (~10 FPS @ 30fps source). Tracker + ghost-cache
+                                # carry identity between. 1 = no throttle (old behaviour).
+  motion_spike_delta: 0.015     # SPIKE: if motion_fraction jumps by >= this between frames,
+                                # force an immediate detect (new person entering). This is what
+                                # keeps recall high while the throttle keeps speed. 1.0 = disabled.
 logging:
   format: '[{time:YYYY-MM-DD HH:mm:ss}] {level} | {message}'
   level: INFO

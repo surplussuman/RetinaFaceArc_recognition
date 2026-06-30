@@ -42,6 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.live_debug import crop_face
 from core.vector_db import VectorDatabase
 from core.video_recognition import create_video_recognizer
+from core.frame_capture import FrameCaptureThread
+from core.inference_engine import SharedInferenceEngine
 
 BASE_DIR = Path(__file__).resolve().parents[1]   # face_events_system/
 STORAGE_DIR = str(BASE_DIR / "storage" / "images")
@@ -108,19 +110,26 @@ def run_live(source: str, threshold: float, skip_frames: int):
         CPU budget = AI only.
     """
     vdb = load_db()
+    # One shared engine (all-core ONNX sessions). Ready to serve multiple streams;
+    # here it backs the single live stream.
+    engine = SharedInferenceEngine()
     recognizer = create_video_recognizer(
         vdb,
         recognition_threshold=threshold,
         process_every_n_frames=skip_frames,
+        engine=engine,
     )
 
     print(f"\nðŸ”´ Live mode â€” connecting to {source}")
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
+    # Async capture: a dedicated thread reads RTSP into a bounded queue (drop stale
+    # frames to stay real-time). The inference loop no longer blocks on cap.read().
+    capture = FrameCaptureThread(source, queue_size=4, drop_stale=True)
+    if not capture.isOpened():
         print(f"ERROR: Cannot open source: {source}")
         sys.exit(1)
+    capture.start()
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    fps = capture.fps or 25
     frame_idx = 0
     # {track_id: wall_clock_time_of_last_event}
     # Allow re-posting the same track after EVENT_COOLDOWN seconds so that
@@ -137,14 +146,13 @@ def run_live(source: str, threshold: float, skip_frames: int):
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("\u26a0  Stream ended or lost \u2014 reconnecting in 2s\u2026")
-                cap.release()
-                time.sleep(2)
-                cap = cv2.VideoCapture(source)
-                seen_tracks.clear()  # let faces fire again after reconnect
+            frame_idx, frame = capture.read(timeout=2.0)
+            if frame is None:
+                # No frame within timeout (reconnecting or stalled) \u2014 keep waiting.
                 continue
+            if capture.consume_reconnect():
+                print("\u26a0  Stream reconnected \u2014 resetting track state")
+                seen_tracks.clear()  # let faces fire again after reconnect
 
             # Debug: log frame info
             if debug_every > 0 and frame_idx % debug_every == 0:
@@ -216,12 +224,10 @@ def run_live(source: str, threshold: float, skip_frames: int):
                         post_event(event)
                         print(f"EVENT: {identity}  conf={confidence:.2f}  t={timestamp:.2f}s")
 
-            frame_idx += 1
-
     except KeyboardInterrupt:
         print("\nðŸ›‘ Stopped.")
     finally:
-        cap.release()
+        capture.stop()
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -230,29 +236,35 @@ def run_live(source: str, threshold: float, skip_frames: int):
 
 def run_file(source: str, threshold: float, skip_frames: int):
     vdb = load_db()
+    engine = SharedInferenceEngine()
     recognizer = create_video_recognizer(
         vdb,
         recognition_threshold=threshold,
         process_every_n_frames=skip_frames,
+        engine=engine,
     )
 
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
+    # Async capture (file mode): never drop frames; block when buffer full so every
+    # frame is processed and output duration stays correct. EOF -> (None, None).
+    capture = FrameCaptureThread(source, queue_size=4, drop_stale=False)
+    if not capture.isOpened():
         print(f"ERROR: Cannot open video: {source}")
         sys.exit(1)
+    capture.start()
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = capture.fps or 25
+    total = capture.total_frames
     print(f"\nðŸ“‚ File mode â€” {Path(source).name}  ({total} frames @ {fps:.1f} FPS)")
 
-    frame_idx = 0
     seen_tracks = set()
     start_time = time.time()
+    frame_idx = -1  # last successfully-read index (stays -1 if video is empty)
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        idx, frame = capture.read(timeout=5.0)
+        if frame is None:
             break
+        frame_idx = idx
 
         result = recognizer.process_frame(frame, frame_idx)
 
@@ -288,11 +300,10 @@ def run_file(source: str, threshold: float, skip_frames: int):
                 post_event(event)
                 print(f"EVENT: {identity}  conf={confidence:.2f}  t={timestamp:.2f}s")
 
-        frame_idx += 1
-
-    cap.release()
+    capture.stop()
     elapsed = time.time() - start_time
-    fps_out = frame_idx / elapsed if elapsed > 0 else 0
+    frames_done = frame_idx + 1
+    fps_out = frames_done / elapsed if elapsed > 0 else 0
     print(f"\n\u2713 Processing complete in {elapsed:.2f}s  ({fps_out:.1f} FPS)")
     events_sent = len(seen_tracks)
     if events_sent:

@@ -36,13 +36,19 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, deque
 from datetime import datetime
+from typing import TYPE_CHECKING
 import json
+import time
+
+if TYPE_CHECKING:
+    from core.inference_engine import SharedInferenceEngine
 
 from core.detector import RetinaFaceDetector
 from core.aligner import FaceAligner
 from core.embedder import ArcFaceEmbedder
 from core.vector_db import VectorDatabase
 from core.motion_detector import MotionDetector
+from core.frame_capture import FrameCaptureThread
 
 
 class FaceTrack:
@@ -738,16 +744,18 @@ class VideoRecognitionSystem:
         print(f"PROCESSING VIDEO: {video_path.name}")
         print(f"{'='*80}\n")
         
-        # Open video
-        cap = cv2.VideoCapture(str(video_path))
+        # Open video via async capture thread (file mode: no drops, blocking backpressure
+        # so every frame is processed and output duration stays correct).
+        cap = FrameCaptureThread(str(video_path), queue_size=4, drop_stale=False)
         if not cap.isOpened():
             raise ValueError(f"Failed to open video: {video_path}")
-        
+        cap.start()
+
         # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.fps
+        width = cap.width
+        height = cap.height
+        total_frames = cap.total_frames
         
         print(f"Video properties:")
         print(f"  Resolution: {width}×{height}")
@@ -775,25 +783,29 @@ class VideoRecognitionSystem:
             'total_detections': 0,
             'unique_tracks': 0,
             'recognized_identities': set(),
-            'processing_times': []
+            'processing_times': [],
+            'io_wait_times': []   # ms spent waiting on decoded frames (should ~0 when overlapped)
         }
-        
+
         # Recognition log (for CSV export)
         recognition_log = []
-        
+
         frame_idx = 0
         start_time = datetime.now()
         last_annotated_frame = None  # Persist last annotation across skipped frames
-        
+
         try:
             while True:
-                ret, frame = cap.read()
-                if not ret:
+                # Pull a decoded frame from the capture thread (overlapped with inference).
+                io_start = time.perf_counter()
+                frame_idx, frame = cap.read(timeout=5.0)
+                stats['io_wait_times'].append((time.perf_counter() - io_start) * 1000)
+                if frame is None:
                     break
-                
+
                 if max_frames and frame_idx >= max_frames:
                     break
-                
+
                 # Process frame
                 frame_start = datetime.now()
                 result = self.process_frame(frame, frame_idx)
@@ -851,13 +863,13 @@ class VideoRecognitionSystem:
                         cv2.imshow('Video Recognition', annotated_frame)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
                             break
-                
-                frame_idx += 1
-                
+
+                # frame_idx is provided by the capture thread (see cap.read() above).
+
                 # Progress callback
                 if progress_callback is not None:
                     progress_callback(frame_idx, total_frames)
-                
+
                 # Progress update
                 if frame_idx % 100 == 0:
                     elapsed = (datetime.now() - start_time).total_seconds()
@@ -865,7 +877,7 @@ class VideoRecognitionSystem:
                     print(f"  Processed {frame_idx}/{total_frames} frames ({fps_actual:.1f} FPS)")
         
         finally:
-            cap.release()
+            cap.stop()
             if writer is not None:
                 writer.release()
             if show_preview:
@@ -889,6 +901,9 @@ class VideoRecognitionSystem:
         print(f"Unique tracks: {stats['unique_tracks']}")
         print(f"Recognized identities: {', '.join(stats['recognized_identities']) if stats['recognized_identities'] else 'None'}")
         print(f"Avg processing time: {stats['avg_processing_time']:.1f}ms/frame")
+        if stats['io_wait_times']:
+            avg_io = np.mean(stats['io_wait_times'])
+            print(f"Avg I/O wait: {avg_io:.1f}ms/frame (async capture; ~0 = fully overlapped)")
         print(f"Total time: {total_time:.2f}s")
         print(f"Actual FPS: {stats['total_frames']/total_time:.2f}")
         
@@ -1047,17 +1062,21 @@ def create_video_recognizer(vector_db: VectorDatabase,
                             recognition_threshold: float = 0.4,
                             process_every_n_frames: Optional[int] = None,
                             enable_ghost_tracking: bool = True,
-                            recognition_interval: int = 30) -> VideoRecognitionSystem:
+                            recognition_interval: int = 30,
+                            engine: Optional['SharedInferenceEngine'] = None) -> VideoRecognitionSystem:
     """
     Create video recognition system with all components.
-    
+
     Args:
         vector_db: Vector database with enrolled users
         recognition_threshold: Minimum similarity for recognition
         process_every_n_frames: Process every N frames (None = read from config, default 1)
         enable_ghost_tracking: Enable Ghost Tracking optimization (p=1/recognition_interval)
         recognition_interval: Frames between re-recognition (30 = 1 sec @ 30fps)
-        
+        engine: Optional SharedInferenceEngine. If provided, the recognizer reuses its
+                shared detector/aligner/embedder sessions instead of creating new ones,
+                so N streams share one set of all-core ONNX sessions.
+
     Returns:
         Configured VideoRecognitionSystem
     """
@@ -1123,6 +1142,8 @@ def create_video_recognizer(vector_db: VectorDatabase,
                             min_motion_area=md_config.get('min_motion_area', 500),
                             motion_gate_threshold=md_config.get('motion_gate_threshold', 0.01),
                             safety_scan_interval=md_config.get('safety_scan_interval', 30),
+                            detect_min_interval=md_config.get('detect_min_interval', 1),
+                            motion_spike_delta=md_config.get('motion_spike_delta', 1.0),
                         )
                     
     except Exception as e:
@@ -1132,10 +1153,18 @@ def create_video_recognizer(vector_db: VectorDatabase,
     if process_every_n_frames is None:
         process_every_n_frames = 1
     
-    detector = RetinaFaceDetector()
-    aligner = FaceAligner()
-    embedder = ArcFaceEmbedder()
-    
+    # Reuse shared sessions when an engine is provided (N streams -> 1 session set);
+    # otherwise build this stream's own components.
+    if engine is not None:
+        print("  Using SharedInferenceEngine sessions (shared across streams)")
+        detector = engine.detector
+        aligner = engine.aligner
+        embedder = engine.embedder
+    else:
+        detector = RetinaFaceDetector()
+        aligner = FaceAligner()
+        embedder = ArcFaceEmbedder()
+
     system = VideoRecognitionSystem(
         detector=detector,
         aligner=aligner,

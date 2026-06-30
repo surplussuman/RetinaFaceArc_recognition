@@ -3616,3 +3616,73 @@ Endpoint smoke:  GET /events 200, GET /stream/status 200, POST /metadata 200, PO
 
 **END OF DOCUMENT**
 
+---
+
+## Phase 13 — Linux Server Deployment: CPU Parallelism + Adaptive Scheduling — 2026-06-30
+
+> Full standalone write-up with all derivations: `docs/CPU_PARALLELISM_OPTIMIZATION_JUN2026.md`
+
+### Root Cause Analysis
+
+Deploying to an AMD EPYC 7643 server (32 vCPUs) revealed it ran **5.36× slower** than a consumer laptop on the *same CPU-only pipeline* (server 177 ms/frame @ 5.24 FPS vs laptop 33 ms/frame @ 28.3 FPS). `top` showed the process pinned at **433% CPU**:
+
+$$\text{Utilisation} = \frac{433\%}{32\times100\%} = \frac{4.33}{32} = 13.5\%$$
+
+The server was **parallelism-starved, not compute-starved** — 86.5% of cores sat idle. A separate scheduling defect was also confirmed: a fixed frame-skip was discarding 80% of frames *before* the motion gate could decide, collapsing recall (detections `349 → 111`, exactly the $1/k$ skip ratio).
+
+### What was done
+
+- **Adaptive Detection Scheduler** (`core/motion_detector.py`): replaced fixed-skip dominance with a scene-driven gate
+  $$\text{detect}(t)=\text{warmup}\lor\text{floor}\lor\text{spike}\lor(\text{motion}\land\text{throttle})$$
+  - **Floor** (`safety_scan_interval`=30): still scenes never blind.
+  - **Spike** (`motion_spike_delta`=0.015): a new person = sudden foreground rise → instant detect → recall preserved.
+  - **Throttle** (`detect_min_interval`=3): sustained motion detects ≤ once per 3 frames → detector capped ~10 FPS, tracker carries the rest.
+  - `process_every_n_frames` set to **1** so every frame reaches the gate.
+- **Problem 1 — ONNX thread cap** (`core/onnx_session.py` new, both configs, `system_config.yaml`): `intra/inter_op 4 → 0` (all cores). Proof the cap *was* the ceiling: 4 threads → max 400% CPU ≈ observed 433%. Central `onnx_threads` key overrides per-model yamls; `ORT_PARALLEL` when `intra_op==0`; startup logs `N / M` cores.
+- **Problem 3 — Blocking I/O** (`core/frame_capture.py` new): `FrameCaptureThread` decouples capture from inference. $T_{frame}=\max(T_{io}, T_{infer})$ instead of their sum. Live = drop-stale; file = blocking backpressure; in-thread RTSP reconnect. Wired into `run_live`, `run_file`, `process_video`.
+- **Problem 2 — Serial "batch" embedding** (`core/embedder.py`, `tools/export_dynamic_batch.py` new): single stacked `[N,3,112,112]→[N,512]` ONNX call, serial fallback on shape error. Sublinear cost $T(N)\approx T(1)N^{0.6}$.
+- **Problem 4 — Per-stream sessions** (`core/inference_engine.py` new): one shared detector + embedder serving N streams (lock-free re-entrant `Run()`); `embed_batch()` coalesces cross-stream face crops within a 5 ms window into one ONNX call via `Future`s. `create_video_recognizer(engine=…)` reuses shared sessions.
+
+### Mathematical / measured results
+
+| Fix | Metric | Before | After |
+|-----|--------|--------|-------|
+| Thread cap | cores used | 4.33 / 32 (13.5%) | all cores (12/12 local, 32/32 server) — 7.4× headroom |
+| Async capture | I/O wait | ~33 ms/frame (blocking) | **0.5 ms/frame** (overlapped) |
+| Batch embed | batch_8 vs 8× serial | 1610 ms | **962 ms (1.67×)**, output diff = 0.0 |
+| Shared engine | 6 concurrent embeds | 6 ONNX runs | **1 ONNX run** |
+| Adaptive sched | sustained-motion detects | every frame | every 3rd (3× fewer), recall kept via spike |
+
+### Scaling projection
+
+| Model | cores/stream | streams / 32-vCPU server |
+|-------|-------------|--------------------------|
+| Before (serial, 4-thread cap) | 4.3 | ~7 |
+| Event-driven + shared sessions | ~0.13–0.5 | **~60–240** |
+
+GPU remains a later multiplier (95→100%), not a prerequisite.
+
+### Constraints honoured
+
+No change to recognition thresholds, ghost-tracking logic, IOU/zone coordinate math, or the `FaceTrack` class. CPU-only (no CUDA). Only new dependency is `onnx` (one-time export tool, not runtime).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `core/onnx_session.py` | **new** — central thread resolver + `ORT_PARALLEL` |
+| `core/frame_capture.py` | **new** — async `FrameCaptureThread` |
+| `core/inference_engine.py` | **new** — `SharedInferenceEngine` + cross-stream coalescing |
+| `tools/export_dynamic_batch.py` | **new** — dynamic-batch ArcFace re-export |
+| `core/detector.py` | resolve threads via `onnx_session`, thread log |
+| `core/embedder.py` | batched `extract_embeddings_batch`, `_preprocess_chw`, `supports_dynamic_batch` |
+| `core/video_recognition.py` | async capture in `process_video`, `engine=` param, I/O-wait stat |
+| `core/motion_detector.py` | adaptive scheduler (spike + throttle on top of floor) |
+| `config/detector_config.yaml`, `config/embedder_config.yaml` | `intra/inter_op 4 → 0` |
+| `config/system_config.yaml` | `onnx_threads`, `process_every_n_frames: 1`, `detect_min_interval`, `motion_spike_delta` |
+| `face_events_system/processor/run_processor.py` | async capture + shared engine |
+
+---
+
+**END OF DOCUMENT — last updated 2026-06-30**
+

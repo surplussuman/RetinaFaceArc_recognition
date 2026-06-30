@@ -19,12 +19,15 @@ Performance:
 - Different-class cosine similarity: μ_b ≈ 0, σ_b ≈ 1/√d ≈ 0.045
 """
 
+import os
 import cv2
 import numpy as np
 import onnxruntime as ort
 from typing import List, Optional, Tuple
 import yaml
 import time
+
+from core.onnx_session import resolve_thread_config, configure_session_options, effective_threads
 
 
 class ArcFaceEmbedder:
@@ -82,9 +85,15 @@ class ArcFaceEmbedder:
         providers = self.config['optimization']['execution_providers']
         
         sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = self.config['optimization']['session']['intra_op_num_threads']
-        sess_options.inter_op_num_threads = self.config['optimization']['session']['inter_op_num_threads']
-        
+
+        # Resolve thread counts: system_config.yaml -> onnx_threads overrides the
+        # per-model yaml. 0 == use all available cores (fixes 4-core utilisation cap).
+        local_intra = self.config['optimization']['session']['intra_op_num_threads']
+        local_inter = self.config['optimization']['session']['inter_op_num_threads']
+        intra_op, inter_op = resolve_thread_config(local_intra, local_inter)
+        configure_session_options(sess_options, intra_op, inter_op)
+        self._effective_threads = effective_threads(intra_op)
+
         # Graph optimization
         opt_level_map = {
             'ORT_DISABLE_ALL': ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
@@ -105,39 +114,47 @@ class ArcFaceEmbedder:
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             print(f"  Execution providers: {self.session.get_providers()}")
+            print(f"  ONNX embedder threads: {self._effective_threads} / {os.cpu_count()} available")
+
+            # Detect dynamic batch axis (symbolic first dim) for batched embedding.
+            in_shape = self.session.get_inputs()[0].shape
+            self.supports_dynamic_batch = not isinstance(in_shape[0], int) or in_shape[0] != 1
+            self.last_batch_ms = 0.0      # timing of the most recent batched call
+            self.last_batch_size = 0
         except Exception as e:
             raise RuntimeError(f"Failed to initialize ONNX session: {e}")
     
-    def preprocess(self, face: np.ndarray) -> np.ndarray:
+    def _preprocess_chw(self, face: np.ndarray) -> np.ndarray:
         """
-        Preprocess aligned face for embedding extraction.
-        
-        Args:
-            face: Aligned face image (BGR format) [H, W, 3]
-        
-        Returns:
-            Preprocessed tensor [1, 3, H, W]
+        Preprocess a single aligned face to CHW tensor [3, H, W] (no batch dim).
+        Used both by preprocess() (adds batch dim) and by the batched path (stacks).
         """
         # Resize if needed
         if face.shape[:2] != self.input_size:
             face = cv2.resize(face, self.input_size, interpolation=cv2.INTER_LINEAR)
-        
+
         # BGR to RGB
         face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-        
-        # Normalize: (pixel / scale) + bias
-        # Typically: (pixel / 127.5) - 1.0 → range [-1, 1]
+
+        # Normalize: (pixel - mean) / std  → range [-1, 1]
         face = face.astype(np.float32)
         face = (face - self.mean) / self.std
-        
-        # Alternative normalization (if using pixel_scale and pixel_bias)
-        # face = (face / self.pixel_scale) + self.pixel_bias
-        
-        # Transpose to CHW and add batch dimension
-        tensor = np.transpose(face, (2, 0, 1))
-        tensor = np.expand_dims(tensor, axis=0)
-        
-        return tensor
+
+        # Transpose to CHW
+        return np.transpose(face, (2, 0, 1))
+
+    def preprocess(self, face: np.ndarray) -> np.ndarray:
+        """
+        Preprocess aligned face for embedding extraction.
+
+        Args:
+            face: Aligned face image (BGR format) [H, W, 3]
+
+        Returns:
+            Preprocessed tensor [1, 3, H, W]
+        """
+        # Add batch dimension for single-face inference
+        return np.expand_dims(self._preprocess_chw(face), axis=0)
     
     def postprocess(self, embedding: np.ndarray) -> np.ndarray:
         """
@@ -242,29 +259,48 @@ class ArcFaceEmbedder:
         
         return embedding
     
+    def _extract_embeddings_serial(self, faces: List[np.ndarray]) -> np.ndarray:
+        """Fallback: one ONNX call per face (works with any model)."""
+        normalized_embeddings = []
+        for face in faces:
+            tensor = self.preprocess(face)
+            raw = self.session.run([self.output_name], {self.input_name: tensor})[0]
+            normalized_embeddings.append(self.postprocess(raw))
+        return np.array(normalized_embeddings)
+
     def extract_embeddings_batch(self, faces: List[np.ndarray]) -> np.ndarray:
         """
-        Extract embeddings for multiple faces (batched inference).
-        
+        Extract embeddings for multiple faces.
+
+        Uses a single batched ONNX call ([N,3,112,112] -> [N,512]) when the model
+        has a dynamic batch axis (sublinear cost: batch_N ≈ batch_1 × N^0.6). Falls
+        back to serial inference if the model is static-batch or raises a shape error.
+
         Args:
             faces: List of aligned face images (BGR)
-        
+
         Returns:
             Embeddings array [N, 512]
         """
         if len(faces) == 0:
             return np.array([])
-        
-        # Process one face at a time — the ONNX model has static batch_size=1.
-        # Batching multiple faces triggers a shape mismatch warning from ONNX Runtime.
-        normalized_embeddings = []
-        for face in faces:
-            tensor = self.preprocess(face)
-            raw = self.session.run([self.output_name], {self.input_name: tensor})[0]
-            emb_norm = self.postprocess(raw)
-            normalized_embeddings.append(emb_norm)
-        
-        return np.array(normalized_embeddings)
+
+        if self.supports_dynamic_batch:
+            try:
+                # Stack all faces into one tensor: [N, 3, 112, 112]
+                batch = np.stack([self._preprocess_chw(f) for f in faces], axis=0)
+                t0 = time.perf_counter()
+                raw = self.session.run([self.output_name], {self.input_name: batch})[0]  # [N, 512]
+                self.last_batch_ms = (time.perf_counter() - t0) * 1000
+                self.last_batch_size = len(faces)
+                # L2-normalize each row independently
+                return np.array([self.postprocess(row) for row in raw])
+            except Exception as e:
+                # Shape error (e.g. model turned out to be static) -> degrade gracefully.
+                print(f"  [embedder] batched inference failed ({e}); falling back to serial")
+                self.supports_dynamic_batch = False
+
+        return self._extract_embeddings_serial(faces)
     
     def compute_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
         """

@@ -105,8 +105,8 @@ optimization:
     
   # Session options
   session:
-    intra_op_num_threads: 4
-    inter_op_num_threads: 4
+    intra_op_num_threads: 0   # 0 = use all available cores (was 4 -> capped at 4 cores)
+    inter_op_num_threads: 0   # 0 = let ORT decide
     graph_optimization_level: "ORT_ENABLE_ALL"
 
 # Batch processing
