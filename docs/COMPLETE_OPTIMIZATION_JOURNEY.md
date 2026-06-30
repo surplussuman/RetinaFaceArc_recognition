@@ -3845,5 +3845,73 @@ threshold, tracking, or model code was touched.
 
 ---
 
+## Phase 16 — Phase 0 Server Results: Verdict = Genuine Slow Allocation — 2026-07-01
+
+> The single-thread harness from Phase 15 was run on the server against the laptop
+> baseline. This is the clean, apples-to-apples measurement Phase 14 lacked.
+
+### The decisive numbers (single-thread, one pinned core)
+
+| Test | Laptop (i5-12450H) | Server (EPYC 7643 vCPU) | Ratio |
+|------|--------------------|--------------------------|-------|
+| matmul 2048² f32 (OpenBLAS) | 165.8 ms | 1050.9 ms | **6.3×** |
+| detector ONNX `intra_op=1` (MLAS) | 251.5 ms | 1745.4 ms | **6.9×** |
+
+### What Phase 0 ruled OUT (recoverable causes)
+
+- **(a) masked instructions** — `avx2`, `fma`, `f16c`, `sse4_2` all present in the guest;
+  MLAS confirms 256-bit AVX2 kernels. Not the cause.
+- **(b) un-tuned BLAS** — `scipy-openblas` (same build as the laptop). Decisively: the
+  ~6.5× gap appears in **ONNX/MLAS too, which never touches OpenBLAS** → not a BLAS bug.
+- **(c)/(d) steal & contention** — the decisive test was one pinned core; idle steal 0.4%.
+  Irrelevant to the single-thread measurement.
+
+Two independent math libraries, same ~6.5× per core ⇒ **the core itself is slow.**
+
+### The quantified nuance
+
+- Clock ratio alone ≈ 1.9× (laptop P-core ~4.4 GHz turbo vs vCPU 2.3 GHz, no turbo).
+- Server SGEMM = **16.3 GFLOPS/core ≈ 22%** of a 2.3 GHz Zen3 core's ~74 GFLOPS peak;
+  laptop = **103 GFLOPS/core ≈ 74%** of peak. The vCPU runs at ~⅓ the efficiency a real
+  Zen3 core should → signature of a **per-vCPU CPU-bandwidth cap** (cgroup throttle).
+- **Steal at idle 0.4% vs 45.3% under a 4 s all-core burst** → sustained aggregate CPU is
+  capped to ~55% of the 32 vCPUs (~17 slow cores ≈ ~2.7 laptop-core-equivalents sustained).
+
+### Verdict
+
+Genuine slow **allocation** (low clock + per-vCPU throttle + ~55% aggregate cap), not a
+software defect. **No Phase-1 library tweak can speed up the core.** The only levers are
+(1) reduce the FLOPs the slow core must do, (2) reduce contention. Phase 2 (lighter model)
+is now justified by data, not assumption.
+
+### Phase 1 gate decision (what the data justifies)
+
+| Item | Decision | Rationale |
+|------|----------|-----------|
+| 1d — CPU affinity + kill stale procs | **do first** | `top`: a python at 235%, several `MainThread`s, `next-server`, `mysqld`, and the **stale `manage.py runserver` PID 3298899 still up 13 days @ 10.5%**. Pin inference off the web stack. |
+| 1c — dynamic ROI input | **do** | model input already `[1,3,'?','?']`; smaller zone crops cut FLOPs ~quadratically, no re-export. |
+| 1b — INT8 quant (A/B flag) | **measure** | no `avx_vnni` on Zen3 → expect only ~1.5–2.5× on the ONNX path. |
+| 1a — BLAS/ISA reinstall | **skip** | AVX2 present, BLAS tuned, pipeline is ONNX-bound (BLAS coretype is academic here). |
+
+### Correction to Phase 14 — now fully resolved
+
+Phase 14's "8.7× silicon" (multi-threaded matmul) was contaminated. The honest, clean
+single-thread figure is **6.3–6.9×**, and it IS genuine per-core allocation — confirmed by
+two independent libraries. Phase 14's *direction* was right; this phase supplies the
+rigorous magnitude and rules out the recoverable software causes.
+
+### Status: STOPPED after Phase 0 (awaiting approval to start Phase 1)
+
+No pipeline, threshold, tracking, or model code touched. Next: implement the justified
+Phase 1 subset (1d + 1c, measure 1b) and prepare the Phase 2 SCRFD-2.5GF comparison.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| _(none — measurement only)_ | Phase 0 diagnostic run; results recorded |
+
+---
+
 **END OF DOCUMENT — last updated 2026-07-01**
 
