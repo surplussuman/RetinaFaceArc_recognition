@@ -58,6 +58,24 @@ def resolve_thread_config(local_intra: int,
         # Never let config issues break session creation; fall back to local values.
         print(f"  [onnx_threads] Could not read {system_config_path}, using local config: {e}")
 
+    # Env override wins over everything. Lets a contended/oversubscribed host
+    # (high CPU steal) cap threads WITHOUT editing the shared config, e.g.:
+    #   ONNX_INTRA_OP=8 ONNX_INTER_OP=1 python ...
+    # On a VM stealing ~half its cycles, fewer threads than cores avoids the
+    # intra-op barrier thrashing that makes 32 threads slower than 8.
+    env_intra = os.environ.get('ONNX_INTRA_OP')
+    env_inter = os.environ.get('ONNX_INTER_OP')
+    if env_intra is not None:
+        try:
+            intra = int(env_intra)
+        except ValueError:
+            print(f"  [onnx_threads] Ignoring invalid ONNX_INTRA_OP={env_intra!r}")
+    if env_inter is not None:
+        try:
+            inter = int(env_inter)
+        except ValueError:
+            print(f"  [onnx_threads] Ignoring invalid ONNX_INTER_OP={env_inter!r}")
+
     return intra, inter
 
 
