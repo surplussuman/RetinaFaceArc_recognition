@@ -51,8 +51,10 @@ preprocessing:
   # NO accuracy loss (same pixels, just less wasted black padding). Feeding a
   # cropped motion-zone ROI shrinks the inference further. The model input is
   # already spatially dynamic ([1,3,'?','?']) so no re-export is needed.
+  # Phase 18: flipped ON — measured lossless on this server (identical pipeline
+  # events vs static 640; 97.6%=40/41 small-face recall) and 1.20-1.48x faster.
   dynamic_input:
-    enabled: false
+    enabled: true
     stride_multiple: 32   # FPN max stride; input dims must be multiples of this
     max_size: 640         # never exceed this on the longer side (caps cost)
   

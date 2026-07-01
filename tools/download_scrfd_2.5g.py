@@ -25,14 +25,16 @@ ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
 TARGET = MODELS / "scrfd_2.5g.onnx"
 
-# buffalo_s pack contains det_2.5g.onnx. Try the canonical store, then a mirror.
+# det_2.5g.onnx ships in the buffalo_M pack (NOT buffalo_s — that pack contains
+# det_500m.onnx). The GitHub release zip is the reliable source; the insightface.ai
+# store is a fallback (its DNS is blocked on some hosts). Verified 2026-07-01.
 ZIP_URLS = [
-    "http://storage.insightface.ai/files/models/buffalo_s.zip",
-    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip",
+    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_m.zip",
+    "http://storage.insightface.ai/files/models/buffalo_m.zip",
 ]
 # Some mirrors host the bare onnx directly.
 DIRECT_URLS = [
-    "https://huggingface.co/immich-app/buffalo_s/resolve/main/det_2.5g.onnx",
+    "https://huggingface.co/immich-app/buffalo_m/resolve/main/det_2.5g.onnx",
 ]
 
 MEMBER_NAMES = ("det_2.5g.onnx", "buffalo_s/det_2.5g.onnx")
@@ -92,9 +94,9 @@ def main():
 
     print("\n[FAILED] Could not download automatically.")
     print("Manual steps:")
-    print("  1. Get the InsightFace 'buffalo_s' pack (contains det_2.5g.onnx), e.g.:")
+    print("  1. Get the InsightFace 'buffalo_m' pack (contains det_2.5g.onnx), e.g.:")
     print("       pip install insightface  # then it auto-downloads on first use, OR")
-    print("       download buffalo_s.zip from http://storage.insightface.ai/files/models/")
+    print("       download buffalo_m.zip from the InsightFace v0.7 GitHub release")
     print(f"  2. Place det_2.5g.onnx at: {TARGET}")
     print("  3. Re-run tools/benchmark_detectors.py")
     return 1

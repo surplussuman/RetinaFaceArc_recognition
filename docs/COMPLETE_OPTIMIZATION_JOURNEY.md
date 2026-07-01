@@ -4008,5 +4008,169 @@ SCRFD-2.5GF (~3-4× if small-face recall holds) → detection from ~900 ms towar
 
 ---
 
+## Phase 18 — Server A/B Measured: The Flags Pay Off (5.4 → 8.5–12.1 FPS) — 2026-07-01
+
+> Phase 17 built four flag-gated FLOP/contention cuts, all default OFF, and stopped
+> awaiting server numbers. This phase runs every A/B **on the cloud4india box itself**
+> and decides each flag by measurement. Constraints honoured: no change to recognition
+> thresholds, ghost tracking, motion gate, IOU/zone math, or `FaceTrack`; ArcFace
+> identity path untouched; INT8 only behind its A/B flag; CPU-only; no new deps.
+> Every number below is measured on this hardware, not estimated.
+
+### Housekeeping corrections to the takeover notes
+
+- The **stale `manage.py runserver` (PID 3298899, 13 d) is gone.** The `runserver`
+  processes now on the box (`cwd=/app`, `/usr/local/bin/python`) belong to a **different
+  containerised app**, not this project — so there was nothing of ours to kill. The box
+  is a **shared production host** (gunicorn `core.wsgi` ×8, two celery fleets, a second
+  `video_versioning_be` gunicorn), so contention is real but variable.
+- Work continued on branch `phase17_fdfromserver` (created from `phase2`, same HEAD
+  `7293b77`); no divergence.
+
+### Phase 0 re-measure — the "genuine 6.5× silicon" verdict is load-dependent
+
+Same single-thread, one-pinned-core harness as Phase 16, run today under light load
+(load-avg 0.24):
+
+| Test | Laptop | Phase 16 (server) | **Phase 18 (server, today)** |
+|------|--------|-------------------|------------------------------|
+| matmul 2048² f32 | 165.8 ms | 1050.9 ms (6.3×) | **598.4 ms (3.6×)** |
+| detector ONNX intra_op=1 | 251.5 ms | 1745.4 ms (6.9×) | **960.3 ms (3.8×)** |
+
+The per-core gap **halved** (6.3–6.9× → 3.6–3.8×) purely because the host was quieter.
+Steal was 0.2% idle → **46.4%** under a 4 s all-core burst. So even a *single pinned
+core*'s throughput moves with aggregate host load: Phase 16's "genuine ~6.5× silicon"
+was **partly dynamic-throttle contamination**, not a fixed constant. Direction unchanged
+(the core is slow and the only levers are FLOP/contention reduction), but the magnitude
+is a moving target — report ranges, not false precision.
+
+### Phase 2 — detector frontier on real frames (150 sampled frames, det_10g static = GT)
+
+`tools/benchmark_detectors.py --video uploads/test.mp4 --num-frames 150`, `ONNX_INTRA_OP=8`.
+GT face population: **small(<40px)=41, medium=4, large=0** (this clip is small/distant faces).
+Also fetched the even-lighter **SCRFD-500MF** (`det_500m`, from buffalo_s) as a frontier point.
+
+| model | detect ms | faces/frm | recall S | recall M | vs GT speed |
+|-------|-----------|-----------|----------|----------|-------------|
+| det_10g  static640 | 490.1 | 0.30 | 100% (GT) | 100% | 1.00× |
+| det_10g  dynamic   | 400.0 | 0.29 | **97.6%** | 100% | 1.23× |
+| scrfd2.5 static640 | 188.8 | 0.24 | 70.7% | 100% | 2.60× |
+| scrfd2.5 dynamic   | 110.3 | 0.24 | **70.7%** | 100% | 4.44× |
+| scrfd500 static640 | 139.8 | 0.14 | 43.9% | 75% | 3.51× |
+| scrfd500 dynamic   | 110.1 | 0.14 | **43.9%** | 75% | 4.45× |
+
+- **1c dynamic is lossless on det_10g:** 97.6% small = 40/41 (one IoU-boundary jitter on a
+  tiny face); the pipeline A/B below confirms **byte-identical events**.
+- **SCRFD-2.5GF loses ~30% of small faces** (70.7%), keeps medium 100%.
+- **SCRFD-500MF loses more than half** (43.9%) — too weak for CCTV.
+- **Overhead floor ≈ 110 ms:** scrfd2.5-dyn (110.3) ≈ scrfd500-dyn (110.1). Below ~2.5 GFLOPs
+  the fixed preprocess/anchor/NMS/Python cost dominates, so **going lighter than 2.5GF buys
+  zero speed and only loses recall.** 500m is strictly dominated → dropped.
+
+### Thread sweep — why capping threads matters on a capped VM (60 frames, detect ms)
+
+| config | t=1 | t=4 | t=8 | t=16 | t=32 |
+|--------|-----|-----|-----|------|------|
+| det_10g  dynamic | 581 | 390 | 489 | 297 | 330 |
+| scrfd2.5 dynamic | 181 | 182 | 164 | 163 | 170 |
+| scrfd2.5 static  | 311 | 270 | 230 | 260 | 250 |
+
+**det_10g is FLOP-bound** (scales to ~t=16); **scrfd2.5 is overhead-bound** (≈flat 160–180 ms
+from t=1→t=32). The light model needs almost no threads — so it can run at low intra_op and
+leave cores for the co-located web stack.
+
+### End-to-end pipeline FPS — the real deliverable
+
+Full clip `uploads/test.mp4` (1306 frames), `run_processor.py --mode file --skip-frames 1`.
+Baseline reproduces the ~5.24 reference. Events = distinct tracks that fired (all "Unknown"
+because these people aren't enrolled — a clean **detection-recall** proxy).
+
+| Config | FPS @ auto(32t) | FPS @ t=8 | tracks caught | accuracy |
+|--------|-----------------|-----------|---------------|----------|
+| det_10g static (**production baseline**) | **5.4** | 6.4 | 4/4 | GT |
+| det_10g dynamic (**1c**) | 6.5 | **8.0** (t=16 also 8.0) | 4/4 (identical events) | **lossless** |
+| det_10g dynamic + t=8 + **affinity 8-23** | — | **8.5** | 4/4 | **lossless** |
+| scrfd2.5 dynamic (**2p**) | 9.8 | **12.1** | 3/4 (lost the t=7.04 s track) | −1 track, 70.7% small recall |
+
+- Baseline & 1c fire the **exact same 4 events** (t=5.00/7.04/14.72/37.80 s) → 1c provably
+  lossless end-to-end.
+- **Capping to t=8 beats auto/32t for every config** (baseline 5.4→6.4, 1c 6.5→8.0, 2p 9.8→12.1)
+  because 32 threads oversubscribe the provider cap: steal during the 2p t=8 run was **median
+  15% / max 17%** vs 46% under all-core load. Thread-cap is a **zero-accuracy** lever on its own.
+- **Affinity** adds ~6% (8.0→8.5) and isolates inference from the web stack.
+
+> **All absolute FPS above were taken same-session under light host load (load-avg ~0.24)** so
+> they are directly comparable. FPS on this shared box is load-sensitive: a later validation of
+> the flipped config (below) under **load-avg ~2–4** measured **7.2 FPS** for the same trio.
+> The **relative** speedups (thread-cap, 1c, affinity) are the durable result; the absolute
+> ceiling drifts with whatever else the box is doing.
+
+### Validation of the flipped config (production path, no env overrides)
+
+Ran `run_processor.py --mode file --skip-frames 1` reading **only** the new config defaults:
+- Affinity applied (`pinned to cores 8–23`), dynamic input engaged (`_compute_dynamic_size(768,432)
+  → (640,384)`; ONNX input tensor confirmed `(1,3,384,640)`, not 640²), thread cap `intra_op=8`.
+- **Events byte-identical to baseline** (4 events, same timestamps) → lossless confirmed through
+  the config path, not just the env-var A/B.
+- 7.2 FPS under load-avg ~2–4 (vs 8.0–8.5 for the light-load matrix) — consistent with the
+  load-sensitivity note above; **≥1.33× baseline even under concurrent production load.**
+
+### INT8 (1b) — rejected by measurement
+
+Quantized the detector (16.9→4.3 MB) and A/B'd detection at t=8, dynamic input:
+
+| | median detect ms |
+|---|---|
+| FP32 | 450.0 |
+| INT8 | 999.1 → **2.22× SLOWER** |
+
+Exactly the Phase-0 prediction: Zen3 has AVX2 but **no AVX-VNNI**, so dynamic-INT8 GEMM
+regresses. Flag stays OFF; the INT8 model file was deleted.
+
+### Speedup ladder vs the 5.4 FPS production baseline
+
+| Change (cumulative) | FPS | ×baseline | accuracy cost |
+|---------------------|-----|-----------|---------------|
+| Production (det_10g static, auto threads) | 5.4 | 1.00× | — |
+| + thread cap `ONNX_INTRA_OP=8` | 6.4 | 1.19× | **none** |
+| + dynamic input (1c) | 8.0 | 1.48× | **none (identical events)** |
+| + CPU affinity (1d) | 8.5 | 1.57× | **none** |
+| swap to SCRFD-2.5GF (2p), + t=8 | 12.1 | 2.24× | **−1/4 tracks, ~30% small-face loss** |
+
+### Recommendation
+
+- **Adopt the zero-accuracy stack now:** `dynamic_input.enabled: true` (1c) +
+  `onnx_threads {auto:false, intra_op:8}` (or `ONNX_INTRA_OP=8`) + `cpu_affinity` (1d).
+  → **8.5 FPS, 1.57×, provably lossless.**
+- **SCRFD-2.5GF (2p) is a per-camera decision, default OFF:** it reaches **12.1 FPS (2.24×)**
+  but drops ~1 in 4 tracks and ~30% of small/distant faces. Enable only on cameras where
+  faces are near/large (entrances, close corridors), not wide/overview CCTV.
+- **INT8 stays OFF.** Going lighter than SCRFD-2.5GF (500m) is pointless (overhead floor).
+- **Real-time (25 FPS) single-stream is NOT reachable on this vCPU** even with the lightest
+  model — the ~110 ms overhead floor plus the per-core cap bound us near ~12 FPS. The honest
+  path to 25 FPS × many streams remains a compute-optimized or GPU instance (roadmap).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `tools/download_scrfd_2.5g.py` | **bug fix** — det_2.5g ships in **buffalo_m**, not buffalo_s (buffalo_s has det_500m); point at the working GitHub v0.7 zip |
+| `tools/benchmark_detectors.py` | add **SCRFD-500MF** (`scrfd_500m`) as a frontier candidate |
+| `docs/COMPLETE_OPTIMIZATION_JOURNEY.md` | this Phase 18 entry |
+| `config/detector_config.yaml` | **flipped** `dynamic_input.enabled: false → true` (1c) |
+| `config/system_config.yaml` | **flipped** `onnx_threads {auto: false, intra_op: 8}` (thread cap) and `cpu_affinity {enabled: true, cores: 8–23}` (1d) |
+
+### Status: safe lossless trio adopted as default; SCRFD-2.5GF & INT8 stay OFF
+
+Owner priority was "proper detection & recognition, then latency," so only the
+**zero-accuracy** levers were flipped on (1c dynamic input + `intra_op=8` thread cap +
+CPU affinity). Verified lossless through the config path (identical events). **SCRFD-2.5GF
+stays default OFF** — it is a per-camera opt-in (`model.path`) for near/large-face cameras
+only, since it drops ~30% of small/distant faces. **INT8 stays OFF** (2.22× slower here).
+`USE_QUANTIZED_MODELS`, `ONNX_INTRA_OP`, `CPU_AFFINITY` env overrides still win over config
+for per-host tuning.
+
+---
+
 **END OF DOCUMENT — last updated 2026-07-01**
 

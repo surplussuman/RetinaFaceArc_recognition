@@ -51,9 +51,12 @@ error_handling:
   max_retries: 3
 # Central ONNX Runtime thread control (overrides detector_config / embedder_config).
 # One place to tune CPU utilisation per server. 0 = use all available cores.
+# Phase 18: capped to 8 on this server. All-32 oversubscribes the provider's
+# sustained-CPU cap (steal 46% under all-core load vs ~15% at t=8) and was SLOWER
+# end-to-end (5.4 FPS auto -> 6.4 at t=8). Zero accuracy cost. Env ONNX_INTRA_OP overrides.
 onnx_threads:
-  auto: true        # true => use all cores (0,0). Set false to use explicit values below.
-  intra_op: 0       # cores per ONNX call when auto=false; 0 = all cores
+  auto: false       # true => use all cores (0,0). Set false to use explicit values below.
+  intra_op: 8       # cores per ONNX call when auto=false; 0 = all cores
   inter_op: 0       # graph-node parallelism threads when auto=false; 0 = let ORT decide
 
 # Phase 1b — INT8 quantized models (A/B). When true, the detector/embedder load
@@ -66,9 +69,11 @@ use_quantized_models: false
 # threads stop fighting the co-located web stack (gunicorn/mysql/redis/celery).
 # Linux only (os.sched_setaffinity); other platforms print a `taskset -c` hint.
 # Env override: CPU_AFFINITY="8-23" or "0,2,4,6". Default off.
+# Phase 18: flipped ON — pins inference to the upper 16 cores, off the web stack
+# on cores 0-7. Measured +6% (8.0 -> 8.5 FPS) and zero accuracy cost. Env CPU_AFFINITY overrides.
 cpu_affinity:
-  enabled: false
-  cores: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  enabled: true
+  cores: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 
 frame_processing:
   max_detection_resolution:

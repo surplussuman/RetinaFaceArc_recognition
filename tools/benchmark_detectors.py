@@ -176,6 +176,7 @@ def main():
     # Assemble candidate list from what's on disk.
     det10g = MODELS / "retinaface_resnet50.onnx"   # actually SCRFD-10GF (Phase 0)
     scrfd25 = MODELS / "scrfd_2.5g.onnx"
+    scrfd05 = MODELS / "scrfd_500m.onnx"
     candidates = []  # (label, model_path, dynamic, gflops_rank)
     if det10g.exists():
         candidates.append(("det_10g  static640", det10g, False, 10))
@@ -186,6 +187,9 @@ def main():
     else:
         print("[note] models/scrfd_2.5g.onnx not found — run tools/download_scrfd_2.5g.py")
         print("       to include the SCRFD-2.5GF comparison.\n")
+    if scrfd05.exists():
+        candidates.append(("scrfd500 static640", scrfd05, False, 0.5))
+        candidates.append(("scrfd500 dynamic ", scrfd05, True, 0.5))
 
     if not candidates:
         print("No detector models found in models/.")
